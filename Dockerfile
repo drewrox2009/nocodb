@@ -1,50 +1,58 @@
-# Stage 1: Build the frontend
-FROM node:22-slim AS frontend-builder
+# Stage 1: Build everything
+FROM node:22-bookworm-slim AS builder
+
+# Install build dependencies for native modules (sqlite3, sharp, etc.)
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN npm install -g pnpm
+
 WORKDIR /usr/app
-COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
-COPY packages/nocodb-sdk/package.json ./packages/nocodb-sdk/
-COPY packages/nocodb-sdk-v2/package.json ./packages/nocodb-sdk-v2/
-COPY packages/nc-gui/package.json ./packages/nc-gui/
-RUN pnpm install --filter nocodb-sdk --filter nocodb-sdk-v2 --filter nc-gui
+
+# Copy all workspace files
 COPY . .
+
+# Install all dependencies at the root
+# This ensures all hoisted dependencies (like vue) are available for all packages
+RUN pnpm install --frozen-lockfile
+
+# Build internal dependencies in order
 RUN pnpm --filter nocodb-sdk run build
 RUN pnpm --filter nocodb-sdk-v2 run build
-# Build the Nuxt frontend
+RUN pnpm --filter nocodb-integrations run build
+
+# Build Frontend
 WORKDIR /usr/app/packages/nc-gui
 RUN npx nuxt build --spa
 
-# Stage 2: Build the backend and assemble
-FROM node:22-slim AS backend-builder
-RUN npm install -g pnpm
-WORKDIR /usr/app
-COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
-COPY packages/nocodb/package.json ./packages/nocodb/
-COPY packages/noco-integrations/package.json ./packages/noco-integrations/
-COPY packages/nc-secret-mgr/package.json ./packages/nc-secret-mgr/
-RUN pnpm install --filter nocodb --filter noco-integrations --filter nc-secret-mgr
-COPY . .
-# Copy frontend build to backend public folder
-COPY --from=frontend-builder /usr/app/packages/nc-gui/.output/public ./packages/nocodb/src/public
-# Build integrations and backend
-RUN pnpm run integrations:build
+# Build Backend
 WORKDIR /usr/app/packages/nocodb
+# Ensure the public directory exists and copy the frontend build into it
+RUN mkdir -p src/public && cp -r ../nc-gui/.output/public/* src/public/
+# Build the production bundle
 RUN npx rspack --config rspack.config.js
 
-# Stage 3: Final Production Image
-FROM node:22-slim
+# Stage 2: Final Production Image
+FROM node:22-bookworm-slim
 WORKDIR /usr/app
 
-# Install production dependencies only if needed, but since we bundle everything with Rspack,
-# we mostly need the dist and node_modules for native dependencies like sqlite3/sharp.
-COPY --from=backend-builder /usr/app/packages/nocodb/dist ./dist
-COPY --from=backend-builder /usr/app/node_modules ./node_modules
+# libvips is often required by sharp
+RUN apt-get update && apt-get install -y libvips-dev && rm -rf /var/lib/apt/lists/*
+
+# Copy the bundled backend and the node_modules (for native modules)
+COPY --from=builder /usr/app/packages/nocodb/dist ./dist
+COPY --from=builder /usr/app/node_modules ./node_modules
 
 # Set environment
 ENV NODE_ENV=production
 ENV NC_DOCKER=true
 
-# Expose port
+# Expose NocoDB default port
 EXPOSE 8080
 
 # Start the application
