@@ -17,17 +17,20 @@ WORKDIR /usr/app
 # Copy all workspace files
 COPY . .
 
-# Install all dependencies at the root
-# This ensures all hoisted dependencies (like vue) are available for all packages
-RUN pnpm install --no-frozen-lockfile
+# Install all dependencies at the root (skip postinstall scripts —
+# nuxt prepare would fail because nocodb-sdk hasn't been built yet)
+RUN pnpm install --no-frozen-lockfile --ignore-scripts
 
 # Build internal dependencies in order
 RUN pnpm --filter nocodb-sdk run build
 RUN pnpm --filter nocodb-sdk-v2 run build
 RUN pnpm --filter nocodb-integrations run build
 
-# Build Frontend
+# Now that the SDK is built, run nuxt prepare to generate types
 WORKDIR /usr/app/packages/nc-gui
+RUN npx nuxt prepare
+
+# Build Frontend
 RUN npx nuxt build --spa
 
 # Build Backend
