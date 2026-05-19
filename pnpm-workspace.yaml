@@ -73,18 +73,18 @@ overrides:
   oxc-resolver@<11.0.0: ">=11.19.1"
   simple-git: "3.33.0"
 
-onlyBuiltDependencies:
-  - "@biomejs/biome"
-  - "@nestjs/core"
-  - "@parcel/watcher"
-  - "@sentry/cli"
-  - "@swc/core"
-  - core-js
-  - esbuild
-  - lz4
-  - msgpackr-extract
-  - nestjs-pino
-  - nx
-  - sharp
-  - sqlite3
-  - vue-demi
+allowBuilds:
+  "@biomejs/biome": true
+  "@nestjs/core": true
+  "@parcel/watcher": true
+  "@sentry/cli": true
+  "@swc/core": true
+  core-js: true
+  esbuild: true
+  lz4: true
+  msgpackr-extract: true
+  nestjs-pino: true
+  nx: true
+  sharp: true
+  sqlite3: true
+  vue-demi: true
