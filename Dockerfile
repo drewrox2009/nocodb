@@ -19,7 +19,7 @@ COPY . .
 
 # Install all dependencies at the root
 # This ensures all hoisted dependencies (like vue) are available for all packages
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --no-frozen-lockfile
 
 # Build internal dependencies in order
 RUN pnpm --filter nocodb-sdk run build
