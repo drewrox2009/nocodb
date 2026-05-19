@@ -1046,12 +1046,23 @@ function parseNestedCondition(obj, qb, pKey?, table?, tableAlias?) {
   return qb;
 }
 
+interface ExtDbConfig {
+  dbMux?: string;
+  sourceId?: string;
+  client?: string;
+  upgrader?: boolean;
+  source?: { upgraderQueries?: string[] };
+  [key: string]: any;
+}
+
 type CustomKnex = Knex & {
   attachToTransaction?: (fn: () => void) => void;
   ops?: (() => void)[];
   _cteGenerator?: CTEGenerator;
   cteGenerator?: (context?: NcContext) => CTEGenerator;
   applyCte?: (qb: Knex.QueryInterface) => void;
+  extDb?: ExtDbConfig;
+  isExternal?: boolean;
 };
 
 type CustomTransaction = Knex.Transaction & {
@@ -1063,7 +1074,7 @@ type CustomTransaction = Knex.Transaction & {
 
 function CustomKnex(
   arg: string | Knex.Config<any> | any,
-  extDb?: any,
+  extDb?: ExtDbConfig,
 ): CustomKnex {
   if (arg?.client === 'sqlite3') {
     arg.useNullAsDefault = true;
@@ -1258,6 +1269,40 @@ function CustomKnex(
 
           _nested: { enumerable: true, writable: true, value: 0 },
           _aborted: { enumerable: true, writable: true, value: false },
+
+          // Mirror the parent connection's CTE helpers onto the transaction.
+          // Callers that pass `dbDriver: baseModel.dbDriver` propagate the trx
+          // as the inner BaseModel's `_dbDriver`, so `this.knex.applyCte(qb)`
+          // resolves to these. Without them, link writes (v3 dataUpdate ->
+          // updateLTARCols -> mmList -> execAndParse) crashed with
+          // "applyCte is not a function". Delegate to `kn._cteGenerator`
+          // so queued blocks are applied against the same generator.
+          cteGenerator: {
+            enumerable: true,
+            value: (context?: NcContext) => {
+              if (!kn._cteGenerator && context) {
+                kn._cteGenerator = new CTEGenerator({ context, knex: kn });
+              }
+              return kn._cteGenerator;
+            },
+          },
+          applyCte: {
+            enumerable: true,
+            value: (qb: Knex.QueryInterface) => {
+              if (kn._cteGenerator) {
+                kn._cteGenerator.applyCte(qb);
+                kn._cteGenerator.clear();
+              }
+            },
+          },
+          clearCte: {
+            enumerable: true,
+            value: () => {
+              if (kn._cteGenerator) {
+                kn._cteGenerator.clear();
+              }
+            },
+          },
         });
 
         return trx;
@@ -1604,3 +1649,4 @@ const parseConditionv2 = (_obj: Filter | FilterType, qb: Knex.QueryBuilder) => {
 
 export default CustomKnex;
 export { Knex, CustomKnex as XKnex };
+export type { ExtDbConfig };

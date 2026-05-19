@@ -22,6 +22,8 @@ import type {
   NestedLinkAuditEntry,
   NestedLinkLastModifiedEntry,
 } from '~/db/BaseModelSqlv2/nested-link-preparator';
+import type { ExecAndParseOptions } from 'src/db/BaseModelSqlv2';
+import type { DisplacedRecord } from '~/command-registry/types';
 
 export interface IBaseModelSqlV2 {
   context: NcContext;
@@ -43,19 +45,14 @@ export interface IBaseModelSqlV2 {
   ): Promise<any>;
   execAndParse(
     qb: Knex.QueryBuilder | string,
-    dependencyColumns?: Column[],
-    options?: {
-      skipDateConversion?: boolean;
-      skipAttachmentConversion?: boolean;
-      skipSubstitutingColumnIds?: boolean;
-      skipUserConversion?: boolean;
-      skipJsonConversion?: boolean;
-      raw?: boolean; // alias for skipDateConversion and skipAttachmentConversion
-      first?: boolean;
-      bulkAggregate?: boolean;
-      apiVersion?: NcApiVersion;
-    },
-  ): Promise<any>;
+    dependencyColumns: Column[] | undefined | null,
+    options: ExecAndParseOptions & { first: true },
+  ): Promise<Record<string, any>>;
+  execAndParse(
+    qb: Knex.QueryBuilder | string,
+    dependencyColumns?: Column[] | null,
+    options?: ExecAndParseOptions,
+  ): Promise<Record<string, any>[]>;
 
   prepareNocoData(
     data,
@@ -95,11 +92,20 @@ export interface IBaseModelSqlV2 {
     timestamp?: string;
   }): Promise<void>;
   readOnlyPrimariesByPkFromModel(
-    props: { model: Model; id: any; extractDisplayValueData?: boolean }[],
+    props: {
+      model: Model;
+      id: any;
+      extractDisplayValueData?: boolean;
+      displayColumn?: Column;
+    }[],
   ): Promise<any[]>;
   fetchDisplayValueMap(
-    props: { model: Model; id: any }[],
+    props: { model: Model; id: any; displayColumn?: Column }[],
   ): Promise<Map<string, any>>;
+  getLtarDisplayColumnOverride(
+    ltarColumn: Column,
+    model: Model,
+  ): Promise<Column | undefined>;
   extractPksValues(data: any, asString?: boolean): any;
   readByPk(
     id?: any,
@@ -286,10 +292,14 @@ export interface IBaseModelSqlV2 {
     insertObj: Record<string, any>;
     req: NcRequest;
   }): Promise<{
-    postInsertOps: ((rowId: any) => Promise<string>)[];
-    preInsertOps: (() => Promise<string>)[];
+    postInsertOps: ((
+      rowId: any,
+      trx?: Knex | Knex.Transaction,
+    ) => Promise<string>)[];
+    preInsertOps: ((trx?: Knex | Knex.Transaction) => Promise<string>)[];
     postInsertAuditEntries: NestedLinkAuditEntry[];
     postInsertLastModifiedEntries: NestedLinkLastModifiedEntry[];
+    displacedRecords: DisplacedRecord[];
   }>;
 
   handleValidateBulkInsert(
@@ -387,6 +397,7 @@ export interface IBaseModelSqlV2 {
     validateFormula?: boolean;
     pkAndPvOnly?: boolean;
     linksAsLtar?: boolean;
+    fk_display_value_column_id?: string | null;
   }): Promise<void>;
   getProto(param?: {
     apiVersion?: NcApiVersion;

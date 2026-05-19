@@ -22,6 +22,7 @@ import NocoCache from '~/cache/NocoCache';
 import { NcError } from '~/helpers/catchError';
 import { extractProps } from '~/helpers/extractProps';
 import { parseMetaProp, stringifyMetaProp } from '~/utils/modelUtils';
+import { isReplay } from '~/helpers/replayScope';
 
 export default class Filter implements FilterType {
   id: string;
@@ -134,9 +135,12 @@ export default class Filter implements FilterType {
       'fk_rls_policy_id',
       'fk_button_col_id',
     ].find((k) => filter[k]);
-    insertObj.order = await ncMeta.metaGetNextOrder(MetaTable.FILTER_EXP, {
-      [referencedModelColName]: filter[referencedModelColName],
-    });
+    const replayKeepOrder = isReplay() && filter.order != null;
+    if (!replayKeepOrder) {
+      insertObj.order = await ncMeta.metaGetNextOrder(MetaTable.FILTER_EXP, {
+        [referencedModelColName]: filter[referencedModelColName],
+      });
+    }
 
     if (!filter.source_id) {
       let model: { base_id?: string; source_id?: string };
@@ -377,12 +381,16 @@ export default class Filter implements FilterType {
       if (filter.fk_view_id) {
         const view = await View.get(context, filter.fk_view_id, false, ncMeta);
 
-        await View.clearSingleQueryCache(
-          context,
-          view.fk_model_id,
-          [view],
-          ncMeta,
-        );
+        // View may be missing if it was deleted concurrently or the filter
+        // is orphaned — skip cache invalidation rather than throwing.
+        if (view) {
+          await View.clearSingleQueryCache(
+            context,
+            view.fk_model_id,
+            [view],
+            ncMeta,
+          );
+        }
       }
     }
 
@@ -438,14 +446,16 @@ export default class Filter implements FilterType {
     {
       const filter = await this.get(context, id, ncMeta);
       // if not a view filter then no need to delete
-      if (filter.fk_view_id) {
+      if (filter?.fk_view_id) {
         const view = await View.get(context, filter.fk_view_id, false, ncMeta);
-        await View.clearSingleQueryCache(
-          context,
-          view.fk_model_id,
-          [{ id: filter.fk_view_id }],
-          ncMeta,
-        );
+        if (view) {
+          await View.clearSingleQueryCache(
+            context,
+            view.fk_model_id,
+            [{ id: filter.fk_view_id }],
+            ncMeta,
+          );
+        }
       }
     }
 
@@ -482,12 +492,14 @@ export default class Filter implements FilterType {
       if (filter.fk_view_id) {
         const view = await View.get(context, filter.fk_view_id, false, ncMeta);
 
-        await View.clearSingleQueryCache(
-          context,
-          view.fk_model_id,
-          [{ id: filter.fk_view_id }],
-          ncMeta,
-        );
+        if (view) {
+          await View.clearSingleQueryCache(
+            context,
+            view.fk_model_id,
+            [{ id: filter.fk_view_id }],
+            ncMeta,
+          );
+        }
       }
     }
   }
@@ -801,12 +813,14 @@ export default class Filter implements FilterType {
     // on update delete any optimised single query cache
     {
       const view = await View.get(context, viewId, false, ncMeta);
-      await View.clearSingleQueryCache(
-        context,
-        view.fk_model_id,
-        [view],
-        ncMeta,
-      );
+      if (view) {
+        await View.clearSingleQueryCache(
+          context,
+          view.fk_model_id,
+          [view],
+          ncMeta,
+        );
+      }
     }
   }
 

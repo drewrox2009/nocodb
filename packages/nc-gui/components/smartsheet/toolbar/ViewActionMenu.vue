@@ -281,9 +281,16 @@ const modifyViewDisabledReason = computed(() => {
   return ''
 })
 
+// Collaborative views cannot be deleted on a sandbox master base — backend guard mirrors this.
+// Personal views (owned_by set) can still be deleted by their owner.
+const isSandboxProductionCollaborativeDelete = computed(() => {
+  return !!base.value?.is_sandbox_production && !view.value?.owned_by
+})
+
 // Tooltip shown when Delete is disabled.
 const deleteDisabledReason = computed(() => {
   if (isLockedView.value) return t('msg.info.disabledAsViewLocked')
+  if (isSandboxProductionCollaborativeDelete.value) return t('msg.info.disabledAsSandboxMasterCollabDelete')
   if (blockViewOperations.value && !isPersonalView.value) return t('msg.info.cantDeleteLastGridView')
   if (isPersonalView.value && !isPersonalViewOwner.value) return t('tooltip.onlyViewOwnerCanDeletePersonalView')
   return ''
@@ -293,6 +300,7 @@ const deleteDisabledReason = computed(() => {
 // (which is enforced for everyone, including creators+).
 const isDeleteDisabled = computed(() => {
   if (!canDeleteView.value) return true
+  if (isSandboxProductionCollaborativeDelete.value) return true
   if (blockViewOperations.value && !isPersonalView.value) return true
   return false
 })
@@ -368,6 +376,8 @@ const isUploadAllowed = computed(() => {
     isUIAllowed('csvTableImport') && !isPublicView.value && !isDataReadOnly.value && table.value?.type !== 'view' // isSqlView
   )
 })
+
+const isUploadDisabledForMmTable = computed(() => !!table.value?.mm)
 
 const copyViewConfigMenuItemStatus = computed(() => {
   return getCopyViewConfigBtnAccessStatus(view.value, 'view-action-menu')
@@ -520,20 +530,27 @@ defineOptions({
       <template v-if="view.type !== ViewTypes.FORM">
         <NcDivider />
         <template v-if="isUploadAllowed">
-          <NcSubMenu key="upload" variant="small">
+          <NcSubMenu key="upload" variant="small" :disabled="isUploadDisabledForMmTable">
             <template #title>
-              <div
-                v-e="[
-                  'c:navdraw:preview-as',
-                  {
-                    sidebar: props.inSidebar,
-                  },
-                ]"
-                class="nc-base-menu-item group"
+              <NcTooltip
+                :disabled="!isUploadDisabledForMmTable"
+                :title="$t('tooltip.uploadNotSupportedOnJunctionTable')"
+                placement="right"
+                class="w-full"
               >
-                <GeneralIcon icon="upload" class="opacity-80" />
-                {{ $t('general.upload') }}
-              </div>
+                <div
+                  v-e="[
+                    'c:navdraw:preview-as',
+                    {
+                      sidebar: props.inSidebar,
+                    },
+                  ]"
+                  class="nc-base-menu-item group"
+                >
+                  <GeneralIcon icon="upload" class="opacity-80" />
+                  {{ $t('general.upload') }}
+                </div>
+              </NcTooltip>
             </template>
 
             <NcMenuItemLabel>
@@ -803,6 +820,14 @@ defineOptions({
           </template>
         </PaymentUpgradeBadgeProvider>
       </template>
+
+      <BookmarksMenuAction
+        v-if="isEeUI"
+        target-type="view"
+        :target-id="view.id!"
+        :meta="{ view_type: view.type, workspace_id: base.fk_workspace_id, base_id: table.base_id, table_id: table.id }"
+        @close="emits('closeModal')"
+      />
 
       <template v-if="isUIAllowed('viewCreateOrEdit')">
         <NcDivider />

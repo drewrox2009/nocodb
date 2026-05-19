@@ -77,6 +77,12 @@ export enum JobTypes {
   ChatApproval = 'chat-approval',
   BaseTrashCleanUp = 'base-trash-clean-up',
   DataImport = 'data-import',
+  SandboxMerge = 'sandbox-merge',
+  ManagedAppUpdate = 'managed-app-update',
+  MailDispatch = 'mail-dispatch',
+  MailOutboxRecovery = 'mail-outbox-recovery',
+  MailScanner = 'mail-scanner',
+  OperationCleanup = 'operation-cleanup',
 }
 
 export const SKIP_STORING_JOB_META = [
@@ -93,6 +99,7 @@ export const SKIP_STORING_JOB_META = [
   JobTypes.WorkflowCronSchedule,
   JobTypes.WorkflowResumeSchedule,
   JobTypes.BaseTrashCleanUp,
+  JobTypes.OperationCleanup,
   JobTypes.ResumeWorkflow,
   JobTypes.HeartbeatWorkflow,
   JobTypes.PollWorkflow,
@@ -188,6 +195,10 @@ export interface DuplicateBaseJobData extends JobData {
     excludeScripts?: boolean;
     excludeDashboards?: boolean;
     excludeWorkflows?: boolean;
+    excludeDocuments?: boolean;
+    excludePersonalViews?: boolean;
+    excludePermissions?: boolean;
+    excludeRls?: boolean;
   };
 }
 
@@ -223,6 +234,24 @@ export interface DuplicateDashboardJobData extends JobData {
   options: never;
 }
 
+export interface SandboxMergeJobData extends JobData {
+  sandboxBaseId: string;
+  productionBaseId: string;
+  sandboxId: string;
+  req: NcRequest;
+  selectedChangelogIds?: string[];
+}
+
+export interface ManagedAppUpdateJobData extends JobData {
+  managedAppId: string;
+  managedAppTitle: string;
+  masterBaseId: string;
+  masterWorkspaceId: string;
+  newVersionId: string;
+  newVersion: string;
+  req: NcRequest;
+}
+
 export interface HandleWebhookJobData extends JobData {
   hookId: string;
   modelId: string;
@@ -249,6 +278,7 @@ export interface DataExportJobData extends JobData {
   viewId: string;
   exportAs: 'csv' | 'json' | 'excel';
   ncSiteUrl: string;
+  locale?: string;
 }
 
 export interface ThumbnailGeneratorJobData extends JobData {

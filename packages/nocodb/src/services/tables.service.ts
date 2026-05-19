@@ -25,8 +25,10 @@ import type {
   UserType,
 } from 'nocodb-sdk';
 import type { MetaService } from '~/meta/meta.service';
-import type { LinkToAnotherRecordColumn, User, View } from '~/models';
-import type { NcContext, NcRequest } from '~/interface/config';
+import type { LinkToAnotherRecordColumn, User } from '~/models';
+import type { NcRequest } from '~/interface/config';
+import type { OperationSource } from '~/helpers/columnHelpers';
+import { NcContext } from '~/interface/config';
 import { ColumnsService } from '~/services/columns.service';
 import { LinkPlaceholderService } from '~/services/link-placeholder.service';
 import { MetaDiffsService } from '~/services/meta-diffs.service';
@@ -37,7 +39,14 @@ import {
   repopulateCreateTableSystemColumns,
 } from '~/helpers/tableHelpers';
 import { ColumnWebhookManagerBuilder } from '~/utils/column-webhook-manager';
-import { Base, Column, Model, ModelRoleVisibility, Permission } from '~/models';
+import {
+  Base,
+  Column,
+  Model,
+  ModelRoleVisibility,
+  Permission,
+  View,
+} from '~/models';
 import { AppHooksService } from '~/services/app-hooks/app-hooks.service';
 import ProjectMgrv2 from '~/db/sql-mgr/v2/ProjectMgrv2';
 import { NcError } from '~/helpers/catchError';
@@ -51,6 +60,8 @@ import { sanitizeColumnName, validatePayload } from '~/helpers';
 import { MetaTable } from '~/utils/globals';
 import NocoSocket from '~/socket/NocoSocket';
 import { validateUniqueConstraint } from '~/helpers/uniqueConstraintHelpers';
+import { OperationName } from '~/command-registry/op-names';
+import { TraceCommand } from '~/decorators/trace-command.decorator';
 
 @Injectable()
 export class TablesService {
@@ -261,6 +272,7 @@ export class TablesService {
     return true;
   }
 
+  @TraceCommand(OperationName.tableReorder)
   async reorderTable(
     context: NcContext,
     param: { tableId: string; order: any; req: NcRequest },
@@ -302,12 +314,11 @@ export class TablesService {
     context: NcContext,
     param: {
       tableId: string;
-      user: User;
       forceDeleteRelations?: boolean;
       forceDeleteSyncs?: boolean;
       skipLinkPlaceholder?: boolean;
       skipTrash?: boolean;
-      req?: any;
+      req: NcRequest;
     },
     ncMetaParam?: MetaService,
   ) {
@@ -316,6 +327,8 @@ export class TablesService {
     }
 
     const ncMeta = ncMetaParam ?? Noco.ncMeta;
+    // Source of truth for the actor — every caller passes `req`.
+    const user = param.req?.user as User;
 
     let result;
     let placeholderRefTables: Map<string, Model>;
@@ -493,7 +506,6 @@ export class TablesService {
           {
             req: param.req,
             columnId: c.id,
-            user: param.user,
             forceDeleteSystem: true,
             skipLinkPlaceholder: true,
             columnWebhookManager,
@@ -528,7 +540,7 @@ export class TablesService {
     if (result) {
       this.appHooksService.emit(AppEvents.TABLE_DELETE, {
         table,
-        user: param.user,
+        user,
         req: param.req,
         context,
       });
@@ -607,6 +619,12 @@ export class TablesService {
 
     if (isServiceUser(param.user, ServiceUserType.WORKFLOW_USER)) {
       await table.getViews(context);
+      // Mask the bcrypt password hash before returning to the caller.
+      if (table.views?.length) {
+        table.views = table.views.map((v) =>
+          View.maskPasswordForResponse(v),
+        ) as View[];
+      }
     } else {
       // todo: optimise
       const viewList = <View[]>(
@@ -656,6 +674,9 @@ export class TablesService {
 
       const views = await model.getViews(context);
       for (const view of views) {
+        // Mask the bcrypt password hash — the owner UI never needs the
+        // stored value; it sees a sentinel and renders a masked state.
+        const safeView = View.maskPasswordForResponse(view);
         obj[view.id] = {
           ptn: model.table_name,
           _ptn: model.title,
@@ -663,7 +684,7 @@ export class TablesService {
           tn: view.title,
           _tn: view.title,
           table_meta: model.meta,
-          ...view,
+          ...safeView,
           disabled: { ...defaultDisabled },
         };
       }
@@ -774,6 +795,7 @@ export class TablesService {
       synced?: boolean;
       apiVersion?: NcApiVersion;
       isDuplicateOperation?: boolean;
+      operationSource?: OperationSource;
     },
   ) {
     // before validating add title for columns if only column name is present
@@ -820,6 +842,7 @@ export class TablesService {
         columns: tableCreatePayLoad.columns,
         clientType: source.type,
         isMeta: !!source.isMeta(),
+        operationSource: param.operationSource,
       });
     }
 

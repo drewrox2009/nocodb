@@ -4,6 +4,7 @@ import {
   isCreatedOrLastModifiedTimeCol,
   isDeletedCol,
   isLinksOrLTAR,
+  isMMOrMMLike,
   isOrderCol,
   isSystemColumn,
   isVirtualCol,
@@ -98,6 +99,12 @@ export function _wherePk(
     ids = (id + '').split('___').map((val) => val.replaceAll('\\_', '_'));
   }
 
+  // Reject incomplete composite ids up-front — otherwise knex builds a
+  // WHERE with `undefined` bindings and throws a generic 500.
+  if (!skipPkValidation && (ids as unknown[]).length < primaryKeys.length) {
+    NcError.invalidPrimaryKey(id, primaryKeys.map((pk) => pk.title).join(','));
+  }
+
   for (let i = 0; i < primaryKeys.length; ++i) {
     if (primaryKeys[i].dt === 'bytea') {
       // if column is bytea, then we need to encode the id to hex based on format
@@ -146,6 +153,13 @@ export function _wherePk(
       : ids[i];
   }
   return where;
+}
+
+/** Split a composite-pk joined string (`"val1___val2"`) into the
+ *  per-column values, un-escaping `\_` → `_` to match the inverse of
+ *  `getCompositePkValue`. */
+export function splitCompositePkString(id: string): string[] {
+  return id.split('___').map((part) => part.replaceAll('\\_', '_'));
 }
 
 export function getCompositePkValue(
@@ -297,11 +311,9 @@ export function getRelatedLinksColumn(
   relatedModel: Model,
 ) {
   return relatedModel.columns.find((c: Column) => {
-    if (
-      column.colOptions?.type === RelationTypes.MANY_TO_MANY ||
-      column.colOptions?.type === RelationTypes.ONE_TO_MANY ||
-      column.colOptions?.type === RelationTypes.MANY_TO_ONE
-    ) {
+    // Junction-based relations (V1 mm + every V2 link) match by swapping
+    // fk_mm_parent_column_id and fk_mm_child_column_id between the two sides.
+    if (isMMOrMMLike(column)) {
       return (
         column.colOptions.fk_mm_child_column_id ===
           c.colOptions?.fk_mm_parent_column_id &&
@@ -344,11 +356,21 @@ export function checkColumnRequired(
   column: Column<any>,
   fields: string[],
   extractPkAndPv?: boolean,
+  fk_display_value_column_id?: string | null,
 ) {
   // if primary key or foreign key included in fields, it's required
   if (column.pk || column.uidt === UITypes.ForeignKey) return true;
 
   if (extractPkAndPv && column.pv) return true;
+
+  // keep the LTAR's custom display value column whenever we're extracting
+  // pk/pv-only rows — treat it as if it were pv for downstream rendering
+  if (
+    extractPkAndPv &&
+    fk_display_value_column_id &&
+    column.id === fk_display_value_column_id
+  )
+    return true;
 
   // check fields defined and if not, then select all
   // if defined check if it is in the fields
@@ -551,6 +573,7 @@ export function shouldSkipField(
   column,
   extractPkAndPv,
   pkAndPvOnly = false,
+  fk_display_value_column_id?: string | null,
 ) {
   // skip row meta column
   if (column.uidt === UITypes.Meta) return true;
@@ -581,8 +604,15 @@ export function shouldSkipField(
       }
     }
 
-    // skip all other columns if pkAndPvOnly passed as true
-    if (pkAndPvOnly && !column.pk && !column.pv) return true;
+    // skip all other columns if pkAndPvOnly passed as true,
+    // but always keep the LTAR's custom display value column when requested
+    if (
+      pkAndPvOnly &&
+      !column.pk &&
+      !column.pv &&
+      column.id !== fk_display_value_column_id
+    )
+      return true;
 
     return false;
   }
@@ -596,12 +626,14 @@ export async function getQueriedColumns(
     view,
     extractPkAndPv,
     pkAndPvOnly,
+    fk_display_value_column_id,
   }: {
     model?: Model;
     view?: View;
     fieldsSet?: Set<string>;
     extractPkAndPv?: boolean;
     pkAndPvOnly?: boolean;
+    fk_display_value_column_id?: string | null;
   },
   ncMeta?: MetaService,
 ) {
@@ -628,6 +660,7 @@ export async function getQueriedColumns(
         viewOrTableColumn,
         extractPkAndPv || pkAndPvOnly,
         pkAndPvOnly,
+        fk_display_value_column_id,
       ),
   );
 }

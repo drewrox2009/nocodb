@@ -15,7 +15,14 @@ export const [useProvideAttachmentCell, useAttachmentCell] = useInjectionState(
 
     const { isUIAllowed } = useRoles()
 
-    const baseURL = $api.instance.defaults.baseURL
+    const { appInfo } = useGlobal()
+
+    const joinAttachmentUrl = (path: string) => {
+      // Resolve ncSiteUrl against the page origin first so a relative value
+      // like '/' (production default) becomes an absolute base URL.
+      const base = new URL(appInfo.value.ncSiteUrl || '/', window.location.origin)
+      return new URL(path, base).toString()
+    }
 
     const { row } = useSmartsheetRowStoreOrThrow()
 
@@ -78,8 +85,6 @@ export const [useProvideAttachmentCell, useAttachmentCell] = useInjectionState(
     })
 
     const isRenameModalOpen = ref(false)
-
-    const { appInfo } = useGlobal()
 
     const defaultAttachmentMeta = {
       ...(appInfo.value.ee && {
@@ -398,17 +403,20 @@ export const [useProvideAttachmentCell, useAttachmentCell] = useInjectionState(
           continue
         }
 
-        const apiPromise = isPublic.value
-          ? () => fetchSharedViewAttachment(columnId!, rowId!, src)
-          : () =>
-              $api.dbDataTableRow.attachmentDownload(modelId!, columnId!, rowId!, {
-                urlOrPath: src,
-              })
-
         let res
 
         try {
-          res = await apiPromise()
+          if (isPublic.value) {
+            res = await fetchSharedViewAttachment(columnId!, rowId!, src)
+          } else {
+            res = await $api.internal.getOperation(meta.value!.fk_workspace_id!, meta.value!.base_id!, {
+              operation: 'attachmentDownload',
+              modelId: modelId!,
+              columnId: columnId!,
+              rowId: rowId!,
+              urlOrPath: src,
+            })
+          }
         } catch {}
 
         if (!res) {
@@ -419,7 +427,7 @@ export const [useProvideAttachmentCell, useAttachmentCell] = useInjectionState(
 
         let response: Response
         if (res.path) {
-          response = await fetch(`${baseURL}/${res.path}`)
+          response = await fetch(joinAttachmentUrl(res.path))
         } else if (res.url) {
           response = await fetch(`${res.url}`)
         } else {
@@ -490,22 +498,27 @@ export const [useProvideAttachmentCell, useAttachmentCell] = useInjectionState(
       const rowId = extractPkFromRow(unref(row).row, meta.value.columns!)
       const src = item.url || item.path
       if (modelId && columnId && rowId && src) {
-        const apiPromise = isPublic.value
-          ? () => fetchSharedViewAttachment(columnId, rowId, src)
-          : () =>
-              $api.dbDataTableRow.attachmentDownload(modelId, columnId, rowId, {
-                urlOrPath: src,
-              })
+        let res
 
-        await apiPromise().then((res) => {
-          if (res?.path) {
-            window.open(`${baseURL}/${res.path}`, '_self')
-          } else if (res?.url) {
-            window.open(res.url, '_self')
-          } else {
-            message.error('Failed to download file')
-          }
-        })
+        if (isPublic.value) {
+          res = await fetchSharedViewAttachment(columnId, rowId, src)
+        } else {
+          res = await $api.internal.getOperation(meta.value.fk_workspace_id!, meta.value.base_id!, {
+            operation: 'attachmentDownload',
+            modelId,
+            columnId,
+            rowId,
+            urlOrPath: src,
+          })
+        }
+
+        if (res?.path) {
+          window.open(joinAttachmentUrl(res.path), '_self')
+        } else if (res?.url) {
+          window.open(res.url, '_self')
+        } else {
+          message.error('Failed to download file')
+        }
       } else {
         message.error('Failed to download file')
       }

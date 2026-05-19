@@ -108,9 +108,14 @@ export enum PlanFeatureTypes {
   FEATURE_DATE_DEPENDENCY = 'feature_date_dependency',
   FEATURE_API_COMMENT_V3 = 'feature_api_comment_v3',
   FEATURE_API_WORKFLOW_MANAGEMENT = 'feature_api_workflow_management',
+  FEATURE_BASE_VARIABLES = 'feature_base_variables',
   /** On-prem: core EE capability flag — true for all paid plans, false for free */
   FEATURE_EE_CORE = 'feature_ee_core',
   FEATURE_TRASH_SETTINGS = 'feature_trash_settings',
+  FEATURE_FORM_GRID_LAYOUT = 'feature_form_grid_layout',
+  FEATURE_TABLE_VISIBILITY = 'feature_table_visibility',
+  FEATURE_FIELD_VISIBILITY = 'feature_field_visibility',
+  FEATURE_BOOKMARKS = 'feature_bookmarks',
 }
 
 export enum PlanTitles {
@@ -386,9 +391,17 @@ export const PlanFeatureUpgradeMessages: Record<PlanFeatureTypes, string> = {
   [PlanFeatureTypes.FEATURE_DATE_DEPENDENCY]: 'to use date dependencies.',
   [PlanFeatureTypes.FEATURE_API_COMMENT_V3]: 'to use comment api.',
   [PlanFeatureTypes.FEATURE_API_WORKFLOW_MANAGEMENT]: 'to use workflow api.',
+  [PlanFeatureTypes.FEATURE_BASE_VARIABLES]: 'to use base variables.',
   [PlanFeatureTypes.FEATURE_EE_CORE]: 'to access enterprise features.',
   [PlanFeatureTypes.FEATURE_TRASH_SETTINGS]:
     'to configure per-table trash settings.',
+  [PlanFeatureTypes.FEATURE_FORM_GRID_LAYOUT]:
+    'to arrange form fields in multi-column rows.',
+  [PlanFeatureTypes.FEATURE_TABLE_VISIBILITY]:
+    'to control table-level visibility.',
+  [PlanFeatureTypes.FEATURE_FIELD_VISIBILITY]:
+    'to control field-level visibility.',
+  [PlanFeatureTypes.FEATURE_BOOKMARKS]: 'to use bookmarks.',
 };
 
 export const getUpgradeMessage = (

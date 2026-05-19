@@ -23,6 +23,7 @@ import Noco from '~/Noco';
 import NocoCache from '~/cache/NocoCache';
 import { extractProps } from '~/helpers/extractProps';
 import { NcError } from '~/helpers/catchError';
+import { isReplay } from '~/helpers/replayScope';
 
 export default class Hook implements HookType {
   id?: string;
@@ -238,6 +239,11 @@ export default class Hook implements HookType {
       insertObj.notification = JSON.stringify(insertObj.notification);
     }
 
+    // Replay-only: preserve sandbox entity ID for idempotent merge
+    if (isReplay() && hook.id) {
+      insertObj.id = hook.id;
+    }
+
     const model = await Model.getByIdOrName(
       context,
       { id: hook.fk_model_id },
@@ -324,6 +330,11 @@ export default class Hook implements HookType {
 
     if (insertObj.notification && typeof insertObj.notification === 'object') {
       insertObj.notification = JSON.stringify(insertObj.notification);
+    }
+
+    // Replay-only: preserve sandbox entity ID for idempotent merge
+    if (isReplay() && hook.id) {
+      insertObj.id = hook.id;
     }
 
     const model = await Model.getByIdOrName(

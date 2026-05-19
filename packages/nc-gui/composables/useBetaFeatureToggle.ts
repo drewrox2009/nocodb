@@ -1,15 +1,4 @@
-import rfdc from 'rfdc'
-
-const deepClone = rfdc()
 const FEATURES = [
-  {
-    id: 'sandbox',
-    title: 'Sandbox',
-    description: 'Allow users to create sandbox environments for testing schema changes before merging.',
-    enabled: false,
-    isEngineering: true,
-    isAdvanced: true,
-  },
   {
     id: 'managed_apps',
     title: 'Managed Apps',
@@ -184,6 +173,15 @@ const FEATURES = [
     enabled: false,
     version: 1,
     isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'expanded_record_panel',
+    title: 'Expanded record side panel',
+    description: 'Open expanded records in a resizable side panel beside the grid instead of a centered modal.',
+    enabled: true,
+    version: 2,
+    isEngineering: false,
     isEE: true,
   },
 ] as const

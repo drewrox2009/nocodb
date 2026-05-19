@@ -30,6 +30,7 @@ import {
   GridViewColumn,
   KanbanView,
   KanbanViewColumn,
+  TimelineRange,
   View,
 } from '~/models';
 import { MetaTable } from '~/cli';
@@ -65,6 +66,7 @@ const getAst = async (
     includeRowColorColumns = false,
     includeButtonFilterColumns = false,
     skipSubstitutingColumnIds = false,
+    fk_display_value_column_id,
   }: {
     query?: RequestQuery;
     extractOnlyPrimaries?: boolean;
@@ -82,6 +84,7 @@ const getAst = async (
     includeRowColorColumns?: boolean;
     includeButtonFilterColumns?: boolean;
     skipSubstitutingColumnIds?: boolean;
+    fk_display_value_column_id?: string | null;
   },
 ): Promise<{
   ast: Ast;
@@ -97,7 +100,7 @@ const getAst = async (
   };
 
   let coverImageId;
-  let dependencyFieldsForCalenderView;
+  let dependencyFieldsForRangeView;
   let kanbanGroupColumnId;
   let sortColumnIds: string[] = [];
   let filterColumnIds: string[] = [];
@@ -113,7 +116,20 @@ const getAst = async (
     // coverImageId = calendar.fk_cover_image_col_id;
     const calenderRanges = await CalendarRange.read(context, view.id);
     if (calenderRanges) {
-      dependencyFieldsForCalenderView = calenderRanges.ranges
+      dependencyFieldsForRangeView = calenderRanges.ranges
+        .flatMap((obj) =>
+          [obj.fk_from_column_id, (obj as any).fk_to_column_id].filter(Boolean),
+        )
+        .map(String);
+    }
+  } else if (view && view.type === ViewTypes.TIMELINE) {
+    // Timeline date columns (start/end) drive the bar position. They are
+    // typically hidden in the Fields menu, so without explicitly forcing
+    // them through `allowedCols`, the data response would strip the values
+    // and the frontend would treat every record as "without dates".
+    const timelineRanges = await TimelineRange.read(context, view.id);
+    if (timelineRanges) {
+      dependencyFieldsForRangeView = timelineRanges.ranges
         .flatMap((obj) =>
           [obj.fk_from_column_id, (obj as any).fk_to_column_id].filter(Boolean),
         )
@@ -174,19 +190,30 @@ const getAst = async (
 
     await extractDependencies(context, model.displayValue, dependencyFields);
 
+    // Include custom display value column if specified by the parent LTAR relation
+    if (fk_display_value_column_id) {
+      const customDisplayCol = model.columns?.find(
+        (c) => c.id === fk_display_value_column_id,
+      );
+      if (customDisplayCol) {
+        ast[getFieldKey(customDisplayCol)] = 1;
+        await extractDependencies(context, customDisplayCol, dependencyFields);
+      }
+    }
+
     return { ast, dependencyFields, parsedQuery: dependencyFields };
   }
 
   if (extractOnlyRangeFields) {
     const ast: Ast = {
-      ...(dependencyFieldsForCalenderView || []).reduce((o, f) => {
+      ...(dependencyFieldsForRangeView || []).reduce((o, f) => {
         const col = model.columns.find((c) => c.id === f);
         return { ...o, [getFieldKey(col)]: 1 };
       }, {}),
     };
 
     await Promise.all(
-      (dependencyFieldsForCalenderView || []).map((f) =>
+      (dependencyFieldsForRangeView || []).map((f) =>
         extractDependencies(
           context,
           model.columns.find((c) => c.id === f),
@@ -231,8 +258,8 @@ const getAst = async (
     if (coverImageId) {
       allowedCols[coverImageId] = 1;
     }
-    if (dependencyFieldsForCalenderView) {
-      dependencyFieldsForCalenderView.forEach((id) => {
+    if (dependencyFieldsForRangeView) {
+      dependencyFieldsForRangeView.forEach((id) => {
         allowedCols[id] = 1;
       });
     }
@@ -278,6 +305,7 @@ const getAst = async (
         const { ast: childAst } = await getAst(refTableContext, {
           model,
           query: query?.nested?.[col.title],
+          fk_display_value_column_id: colOpt.fk_display_value_column_id,
           dependencyFields: (dependencyFields.nested[col.title] =
             dependencyFields.nested[col.title] || {
               nested: {},
@@ -323,6 +351,7 @@ const getAst = async (
           model,
           query: query?.nested?.[col.title],
           extractOnlyPrimaries: nestedFields !== '*',
+          fk_display_value_column_id: colOpt.fk_display_value_column_id,
           dependencyFields: (dependencyFields.nested[col.title] =
             dependencyFields.nested[col.title] || {
               nested: {},
@@ -343,7 +372,11 @@ const getAst = async (
     if (col.uidt === UITypes.Meta) {
       isRequested = false;
     } else if (isSortOrFilterColumn) {
-      isRequested = true;
+      // For LTAR / Lookup columns with a custom display value override, `value`
+      // holds the nested AST that tells the query builder to include that
+      // override column. Without an override, the legacy `true` is correct
+      // (pk + pv) — using `value` could narrow the response to a stale subset.
+      isRequested = value;
     } else if (
       rowColoringColumnIds.has(col.id) ||
       buttonFilterColumnIds.has(col.id)
@@ -368,29 +401,38 @@ const getAst = async (
     } else if (isDeletedCol(col) && col.system) {
       isRequested = false;
     } else if (getHiddenColumn) {
-      isRequested =
+      const isVisibleNonHiddenColumn =
+        (!view || !!view?.show_system_fields) && !isHiddenCol(col, model);
+      const isCreatedOrLastModifiedSystemCol =
+        isCreatedOrLastModifiedTimeCol(col) && col.system;
+      // include non-has-many system links (self-link); has-many is part of
+      // the mm relation and isn't needed on its own
+      const isNonHasManySystemLink =
+        isLinksOrLTAR(col) &&
+        col.system &&
+        [
+          RelationTypes.BELONGS_TO,
+          RelationTypes.MANY_TO_MANY,
+          RelationTypes.ONE_TO_ONE,
+        ].includes(
+          (col.colOptions as LinkToAnotherRecordColumn)?.type as RelationTypes,
+        );
+
+      const shouldIncludeColumn =
         !isSystemColumn(col) ||
-        ((!view || !!view?.show_system_fields) && !isHiddenCol(col, model)) ||
-        (isCreatedOrLastModifiedTimeCol(col) && col.system) ||
-        // include all non-has-many system links(self-link) columns since has-many is part of mm relation and which is not required
-        (isLinksOrLTAR(col) &&
-          col.system &&
-          [
-            RelationTypes.BELONGS_TO,
-            RelationTypes.MANY_TO_MANY,
-            RelationTypes.ONE_TO_ONE,
-          ].includes(
-            (col.colOptions as LinkToAnotherRecordColumn)
-              ?.type as RelationTypes,
-          )) ||
+        isVisibleNonHiddenColumn ||
+        isCreatedOrLastModifiedSystemCol ||
+        isNonHasManySystemLink ||
         col.pk;
+
+      isRequested = shouldIncludeColumn && value;
     } else if (allowedCols && (!includePkByDefault || !col.pk)) {
       isRequested =
         allowedCols[col.id] &&
         (!isSystemColumn(col) ||
           (!view && isCreatedOrLastModifiedTimeCol(col)) ||
           view.show_system_fields ||
-          (dependencyFieldsForCalenderView ?? []).includes(col.id) ||
+          (dependencyFieldsForRangeView ?? []).includes(col.id) ||
           col.pv) &&
         (!fields?.length || isInFields) &&
         value;

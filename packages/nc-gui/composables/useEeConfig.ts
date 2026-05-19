@@ -134,6 +134,10 @@ export const useEeConfig = createSharedComposable(() => {
     return true
   }
 
+  const getFeatureForPlanTitle = (..._args: any[]) => {
+    return true
+  }
+
   const getHigherPlan = (..._args: any[]) => {}
 
   const getPlanTitle = (..._args: any[]) => {}
@@ -260,6 +264,10 @@ export const useEeConfig = createSharedComposable(() => {
 
   const showUpgradeToUseViewSections = (..._args: any[]) => {}
 
+  const blockBaseVariables = computed(() => true)
+
+  const showUpgradeToUseBaseVariables = (..._args: any[]) => {}
+
   const showSandboxPlanLimitExceededModal = (..._args: any[]) => {}
   const showUpgradeToUseListView = (..._args: any[]) => {}
 
@@ -302,6 +310,10 @@ export const useEeConfig = createSharedComposable(() => {
 
   const showUpgradeToUseTrashSettings = (..._args: any[]) => {}
 
+  const blockFormGridLayout = computed(() => true)
+
+  const showUpgradeToUseFormGridLayout = (..._args: any[]) => {}
+
   const blockSnapshots = computed(() => true)
 
   const showUpgradeToUseSnapshots = (..._args: any[]) => {}
@@ -318,12 +330,17 @@ export const useEeConfig = createSharedComposable(() => {
 
   const showUpgradeToUseWorkflows = (..._args: any[]) => {}
 
+  const blockBookmarks = computed(() => true)
+
+  const showUpgradeToUseBookmarks = (..._args: any[]) => {}
+
   return {
     calculatePrice,
     getLimit,
     getStatLimit,
     updateStatLimit,
     getFeature,
+    getFeatureForPlanTitle,
     isPaidPlan,
     activePlan,
     activePlanTitle,
@@ -439,6 +456,8 @@ export const useEeConfig = createSharedComposable(() => {
     showUpgradeToUseFormScheduling,
     blockViewSections,
     showUpgradeToUseViewSections,
+    blockBaseVariables,
+    showUpgradeToUseBaseVariables,
     blockListView,
     showUpgradeToUseListView,
     blockMapView,
@@ -466,8 +485,12 @@ export const useEeConfig = createSharedComposable(() => {
     showUpgradeToUseScripts,
     blockWorkflows,
     showUpgradeToUseWorkflows,
+    blockBookmarks,
+    showUpgradeToUseBookmarks,
     blockTrashSettings,
     showUpgradeToUseTrashSettings,
+    blockFormGridLayout,
+    showUpgradeToUseFormGridLayout,
     blockMfa,
     showUpgradeToUseMfa,
     blockForce2fa,

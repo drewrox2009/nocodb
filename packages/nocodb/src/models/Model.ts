@@ -29,6 +29,7 @@ import Column from '~/models/Column';
 import { extractProps } from '~/helpers/extractProps';
 import { sanitize } from '~/helpers/sqlSanitize';
 import { NcError } from '~/helpers/catchError';
+import { getReplay } from '~/helpers/replayScope';
 import {
   CacheDelDirection,
   CacheGetType,
@@ -286,10 +287,12 @@ export default class Model implements TableType {
       ncMeta,
     );
 
+    const sandboxDefaultViewId = getReplay('sandboxDefaultViewId');
     await View.insertMetaOnly(
       context,
       {
         view: {
+          ...(sandboxDefaultViewId ? { id: sandboxDefaultViewId } : {}),
           fk_model_id: id,
           title: model.title || model.table_name,
           type: ViewTypes.GRID,

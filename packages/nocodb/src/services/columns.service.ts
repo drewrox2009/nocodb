@@ -1,5 +1,6 @@
 import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
 import { pluralize, singularize } from 'inflection';
+import { customAlphabet } from 'nanoid';
 import {
   AppEvents,
   ButtonActionsType,
@@ -13,10 +14,13 @@ import {
   isLinksOrLTAR,
   isMMOrMMLike,
   isServiceUser,
+  isSupportedDisplayValueColumn,
   isSystemColumn,
   isVirtualCol,
   LinksVersion,
   LongTextAiMetaProp,
+  LongTextRichModeMetaProp,
+  LongTextSmartModeMetaProp,
   MetaEventType,
   NcApiVersion,
   NcBaseError,
@@ -39,7 +43,7 @@ import {
 import { getProjectRole } from 'nocodb-sdk';
 import { dateFormats, dateMonthFormats } from 'nocodb-sdk';
 import rfdc from 'rfdc';
-import type { ClientType } from 'nocodb-sdk';
+import { ClientType } from 'nocodb-sdk';
 import type {
   ColumnReqType,
   LinkToAnotherColumnReqType,
@@ -49,12 +53,15 @@ import type {
 import type { BaseModelSqlv2 } from '~/db/BaseModelSqlv2';
 import type CustomKnex from '~/db/CustomKnex';
 import type SqlMgrv2 from '~/db/sql-mgr/v2/SqlMgrv2';
-import type { NcContext, NcRequest } from '~/interface/config';
+import type { NcRequest } from '~/interface/config';
 import type { Base, LinkToAnotherRecordColumn } from '~/models';
 import type {
   IColumnsService,
+  LtarSideEffectIds,
   ReusableParams,
 } from '~/services/columns.service.type';
+import type { ColumnBackupRef } from '~/services/column-data-backup-handler';
+import { NcContext } from '~/interface/config';
 import {
   type ColumnWebhookManager,
   ColumnWebhookManagerBuilder,
@@ -70,14 +77,22 @@ import {
   generateFkName,
   getMMColumnNames,
   getRevType,
+  type OperationSource,
   sanitizeColumnName,
   validateLookupPayload,
   validatePayload,
   validateRequiredField,
   validateRollupPayload,
 } from '~/helpers';
+import {
+  captureForTrace,
+  TraceCommand,
+} from '~/decorators/trace-command.decorator';
+import { getReplay, setReplay } from '~/helpers/replayScope';
+import { OperationName } from '~/command-registry/op-names';
 import { NcError } from '~/helpers/catchError';
 import { extractProps } from '~/helpers/extractProps';
+import { pgQuoteLiteral } from '~/helpers/sqlSanitize';
 import getColumnPropsFromUIDT from '~/helpers/getColumnPropsFromUIDT';
 import {
   getUniqueColumnAliasName,
@@ -104,7 +119,9 @@ import {
 import Noco from '~/Noco';
 import { AppHooksService } from '~/services/app-hooks/app-hooks.service';
 import { IFormulaColumnTypeChanger } from '~/services/formula-column-type-changer.types';
+import { ColumnDataBackupHandler } from '~/services/column-data-backup-handler.service';
 import { ViewRowColorService } from '~/services/view-row-color.service';
+import { ViewColumnsService } from '~/services/view-columns.service';
 import { FiltersService } from '~/services/filters.service';
 import { DuplicateDetectionService } from '~/services/duplicate-detection.service';
 import { LinkPlaceholderService } from '~/services/link-placeholder.service';
@@ -123,7 +140,11 @@ import { getRelatedModelMap } from '~/utils/getRelatedModelMap';
 import { validateColumnInternalMeta } from '~/types/column-internal-meta';
 import { backfillAutoNumber } from '~/helpers/autonumberHelpers';
 
-export type { ReusableParams } from '~/services/columns.service.type';
+export type {
+  LtarSideEffectIds,
+  ReusableParams,
+} from '~/services/columns.service.type';
+import { isReplay } from '~/helpers/replayScope';
 
 const deepClone = rfdc();
 
@@ -151,6 +172,26 @@ const hasDuplicateOptionTitles = (
   );
 };
 
+// True when this column is a SingleSelect backed by a native PostgreSQL enum
+// type (introspected from an external source, with the type name remembered
+// in internal_meta.pg_enum_type_name). For these columns option add/rename
+// must go through ALTER TYPE; option delete needs a type rebuild (PG has no
+// DROP VALUE).
+const isPgNativeEnumColumn = (column: any, driverType: string): boolean => {
+  return (
+    driverType === 'pg' &&
+    column?.dt === 'USER-DEFINED' &&
+    !!column?.internal_meta?.pg_enum_type_name &&
+    !!column?.internal_meta?.pg_enum_schema_name
+  );
+};
+
+// Lowercase alphanumeric — safe inside a PG identifier when concatenated.
+const enumRebuildSuffix = customAlphabet(
+  'abcdefghijklmnopqrstuvwxyz0123456789',
+  8,
+);
+
 function validateDateFormatMeta(context: NcContext, meta: unknown) {
   let parsed;
   try {
@@ -161,6 +202,34 @@ function validateDateFormatMeta(context: NcContext, meta: unknown) {
   if (parsed?.date_format && !ALLOWED_DATE_FORMATS.has(parsed.date_format)) {
     NcError.get(context).badRequest('Invalid date format');
   }
+}
+
+// Resolves the LTAR custom display value column id against the related table.
+// Missing column silently falls back to null (handles stale client state and
+// cross-session schema drift). Existing-but-unsupported column type throws —
+// that's a caller-contract violation we want to surface.
+//
+// Also enforces the enterprise-license gate: the override is an EE-only
+// feature, so any non-null payload on a non-EE instance is rejected.
+function resolveDisplayValueColumnOrThrow(
+  context: NcContext,
+  relatedTable: Model,
+  requestedId: string | null | undefined,
+): string | null {
+  if (!requestedId) return null;
+  if (!Noco.isEE()) {
+    NcError.get(context).badRequest(
+      'Custom display value field is an enterprise feature',
+    );
+  }
+  const col = relatedTable.columns?.find((c) => c.id === requestedId);
+  if (!col) return null;
+  if (!isSupportedDisplayValueColumn(col)) {
+    NcError.get(context).badRequest(
+      'Selected column type is not supported as a display value field',
+    );
+  }
+  return col.id;
 }
 
 // todo: move
@@ -297,6 +366,58 @@ const generateColumnDeleteHandler = (
   };
 };
 
+/**
+ * Validate that LongText meta flags richMode / smartMode / ai are mutually
+ * exclusive — at most one may be true on a single column.
+ *
+ * Also enforces that smartMode is only enabled on internal PostgreSQL sources:
+ * the runtime read/write paths use `nc_row_meta` JSONB (added only when
+ * `isEE && clientType === PG` in tableHelpers) and PG-specific JSONB
+ * operators in prepareMetaUpdateQuery. Allowing smartMode on SQLite/MySQL
+ * meta DBs creates a column the user can never use (no nc_row_meta) and on
+ * EE with non-PG meta DB triggers a runtime crash.
+ */
+function validateLongTextMetaExclusivity(
+  context: NcContext,
+  uidt: UITypes | string | undefined,
+  meta: Record<string, any> | null | undefined,
+  source: Source | null | undefined,
+) {
+  if (uidt !== UITypes.LongText || !meta) return;
+
+  const richMode = !!meta[LongTextRichModeMetaProp];
+  const smartMode = !!meta[LongTextSmartModeMetaProp];
+  const aiMode = !!meta[LongTextAiMetaProp];
+
+  if ([richMode, smartMode, aiMode].filter(Boolean).length > 1) {
+    NcError.get(context).invalidRequestBody(
+      'richMode, smartMode, and AI generation are mutually exclusive on LongText',
+    );
+  }
+
+  // Skip the source-eligibility check when no source is provided.
+  // `Source.isMeta()` (without args) returns is_meta || is_local — the broad
+  // "internal source" semantics used by other column validators in this file.
+  // Internal sources have `type` set to the actual DB driver (`db?.client`
+  // for is_meta, explicit 'pg' / 'sqlite3' for is_local), so type !== 'pg'
+  // catches non-PG meta DBs and is_local SQLite minimal-DBs alike.
+  if (smartMode && source) {
+    if (!source.isMeta()) {
+      NcError.get(context).invalidRequestBody(
+        'SmartText is only supported on internal sources',
+      );
+    }
+    // Compare by string — `Source.type` is typed as DriverClient (backend
+    // enum) while ClientType is the SDK-side enum; both share the 'pg' value
+    // but TS sees them as disjoint. The string compare is the cross-enum-safe form.
+    if ((source.type as string) !== ClientType.PG) {
+      NcError.get(context).invalidRequestBody(
+        'SmartText is only supported on PostgreSQL meta databases',
+      );
+    }
+  }
+}
+
 @Injectable()
 export class ColumnsService implements IColumnsService {
   protected logger = new Logger(ColumnsService.name);
@@ -311,6 +432,8 @@ export class ColumnsService implements IColumnsService {
     protected readonly metaDependencyEventHandler: MetaDependencyEventHandler,
     protected readonly duplicateDetectionService: DuplicateDetectionService,
     protected readonly linkPlaceholderService: LinkPlaceholderService,
+    protected readonly columnDataBackupHandler: ColumnDataBackupHandler,
+    protected readonly viewColumnsService: ViewColumnsService,
   ) {}
 
   /**
@@ -498,11 +621,82 @@ export class ColumnsService implements IColumnsService {
     ncMeta = Noco.ncMeta,
   ): Promise<Model | Column<any>> {
     const reuse = param.reuse || {};
-
-    const { req } = param;
-
     const column = await Column.get(context, { colId: param.columnId });
     const oldColumn = deepClone(column);
+
+    let createdBackup: ColumnBackupRef | undefined;
+    if (
+      await this.shouldBackupBeforeTypeChange(context, column, param.column)
+    ) {
+      try {
+        createdBackup = await this.columnDataBackupHandler.backup(context, {
+          sourceColumn: column,
+          backupUid: ColumnDataBackupHandler.newBackupUid(),
+          forUndo: !!getReplay('replayBackup'),
+        });
+        // Two ALS deposits, two readers:
+        //  - `captureForTrace('backup', …)` → `recordCommand` packs this onto
+        //    the changelog row's `meta.backup` for the original forward op.
+        //  - `setReplay('columnBackupOut', …)` → the handler reads this
+        //    post-call to thread the ref into `metaUpdate` (so subsequent
+        //    redo cycles point at the new backup column, not the dropped one).
+        captureForTrace('backup', createdBackup);
+        setReplay('columnBackupOut', createdBackup);
+      } catch (e) {
+        this.logger.warn(
+          `Column data backup failed for ${column.id} (${column.uidt} → ${
+            (param.column as any).uidt
+          }): ${
+            (e as Error).message
+          }. Type change will proceed without undo support.`,
+        );
+      }
+    }
+
+    try {
+      return await this._runColumnUpdate(
+        context,
+        param,
+        column,
+        oldColumn,
+        reuse,
+        ncMeta,
+      );
+    } catch (err) {
+      if (createdBackup) {
+        try {
+          await this.columnDataBackupHandler.drop(context, {
+            backupRef: createdBackup,
+          });
+        } catch (dropErr) {
+          this.logger.warn(
+            `Failed to drop orphaned backup column for ${column.id}: ${
+              (dropErr as Error).message
+            }`,
+          );
+        }
+      }
+      throw err;
+    }
+  }
+
+  protected async shouldBackupBeforeTypeChange(
+    _context: NcContext,
+    _oldColumn: Column<any> | null | undefined,
+    _requestColumn: any,
+  ): Promise<boolean> {
+    return false;
+  }
+
+  protected async _runColumnUpdate(
+    context: NcContext,
+    param: Parameters<ColumnsService['columnUpdate']>[1],
+    column: Column<any>,
+    oldColumn: any,
+    reuse: ReusableParams,
+    ncMeta = Noco.ncMeta,
+  ): Promise<Model | Column<any>> {
+    const { req } = param;
 
     validateDateFormatMeta(context, (param.column as any)?.meta);
 
@@ -551,6 +745,17 @@ export class ColumnsService implements IColumnsService {
     const source = await reuseOrSave('source', reuse, async () =>
       Source.get(context, table.source_id),
     );
+
+    // Merge incoming meta with existing column meta to validate the post-update state.
+    if (column.uidt === UITypes.LongText) {
+      const incomingMeta = parseProp((param.column as any)?.meta);
+      const existingMeta = parseProp(column.meta);
+      const mergedMeta =
+        incomingMeta !== undefined && incomingMeta !== null
+          ? { ...existingMeta, ...incomingMeta }
+          : existingMeta;
+      validateLongTextMetaExclusivity(context, column.uidt, mergedMeta, source);
+    }
 
     const columnWebhookManager =
       param.columnWebhookManager ??
@@ -849,6 +1054,76 @@ export class ColumnsService implements IColumnsService {
     } & Partial<Pick<ColumnReqType, 'column_order'>>;
     sqlUi.adjustLengthAndScale(colBody);
 
+    // Native PG enum SingleSelect → another uidt: pre-convert the column to
+    // text in the DB (with USING cast) and clear the enum binding. This lets
+    // every downstream branch (MultiSelect conversion, text/number/etc.)
+    // operate on a plain text-backed column without dialect-specific casts.
+    // After the cast we attempt to DROP the enum type if we're the sole
+    // owner; if the type is shared or referenced by other DB objects we leave
+    // it in place.
+    if (
+      column.uidt === UITypes.SingleSelect &&
+      colBody.uidt &&
+      colBody.uidt !== UITypes.SingleSelect &&
+      isPgNativeEnumColumn(column, sqlClientType)
+    ) {
+      const baseModel = await reuseOrSave('baseModel', reuse, async () =>
+        Model.getBaseModelSQL(context, {
+          id: table.id,
+          dbDriver: await reuseOrSave('dbDriver', reuse, async () =>
+            NcConnectionMgrv2.get(source),
+          ),
+        }),
+      );
+      const enumTypeName = column.internal_meta!.pg_enum_type_name!;
+      const enumSchema = column.internal_meta!.pg_enum_schema_name!;
+      await sqlClient.raw(
+        `ALTER TABLE ?? ALTER COLUMN ?? TYPE text USING ??::text`,
+        [
+          baseModel.getTnPath(table.table_name),
+          column.column_name,
+          column.column_name,
+        ],
+      );
+
+      // After the ALTER the column no longer references the enum. If no
+      // other column in the database uses this type, attempt to drop it.
+      // Other DB objects (functions, indexes, views) could still hold
+      // references — in that case PG raises and we log a warning rather
+      // than fail the conversion.
+      try {
+        const otherRefs = await sqlClient.findColumnsUsingType({
+          typeSchema: enumSchema,
+          typeName: enumTypeName,
+        });
+        if (otherRefs.length === 0) {
+          await sqlClient.raw('DROP TYPE ??.??', [enumSchema, enumTypeName]);
+        }
+      } catch (e) {
+        this.logger.warn(
+          `Could not drop ${enumSchema}.${enumTypeName} after column ` +
+            `conversion — it is still referenced by another database object. ` +
+            `Column conversion is persisted; orphan type left for manual cleanup. ` +
+            `Reason: ${e?.message ?? e}`,
+        );
+      }
+
+      // Strip the enum binding from in-memory state so subsequent code paths
+      // see a vanilla text column.
+      const cleanedInternalMeta = { ...(column.internal_meta || {}) };
+      delete cleanedInternalMeta.pg_enum_type_name;
+      delete cleanedInternalMeta.pg_enum_schema_name;
+      column.internal_meta = cleanedInternalMeta;
+      column.dt = 'text';
+      colBody.internal_meta = cleanedInternalMeta;
+      // Persist immediately so a mid-update failure doesn't leave NocoDB
+      // metadata claiming the column is still bound to the enum type.
+      await Column.update(context, column.id, {
+        dt: 'text',
+        internal_meta: cleanedInternalMeta,
+      });
+    }
+
     // Store unique constraint name in internal_meta field when enabling unique constraint
     // This ensures we can drop the constraint even if table/column name changes later
     // internal_meta is an internal field (not exposed via API)
@@ -1107,6 +1382,55 @@ export class ColumnsService implements IColumnsService {
                 ).colOptions.fk_target_view_id,
               });
             }
+
+            // update custom display value column
+            if (
+              (colBody as any).fk_display_value_column_id === null ||
+              (colBody as any).fk_display_value_column_id
+            ) {
+              // Resolve via shared helper — missing column silently becomes
+              // null, unsupported type throws. Mirrors the create path.
+              let resolvedDisplayValueColumnId: string | null =
+                (colBody as any).fk_display_value_column_id ?? null;
+              if (resolvedDisplayValueColumnId) {
+                const colOptions =
+                  await column.getColOptions<LinkToAnotherRecordColumn>(
+                    context,
+                  );
+                // For cross-base LTAR the related model lives in a different
+                // base — use the ref context so Model.getWithInfo can find it.
+                const { refContext: colRefContext } =
+                  colOptions.getRelContext(context);
+                const relatedModel = await Model.getWithInfo(colRefContext, {
+                  id: colOptions.fk_related_model_id,
+                });
+                if (!relatedModel) {
+                  NcError.get(context).tableNotFound(
+                    colOptions.fk_related_model_id,
+                  );
+                }
+                resolvedDisplayValueColumnId = resolveDisplayValueColumnOrThrow(
+                  context,
+                  relatedModel,
+                  resolvedDisplayValueColumnId,
+                );
+              }
+
+              await Column.updateDisplayValueColumn(context, {
+                colId: param.columnId,
+                fk_display_value_column_id: resolvedDisplayValueColumnId,
+              });
+
+              // Re-clear after the write — changing the display value column
+              // changes the generated SQL for any query that expands this LTAR
+              // nested list. Clearing before the update leaves a small window
+              // where a concurrent request repopulates the cache with stale SQL.
+              await View.clearSingleQueryCache(
+                context,
+                column.fk_model_id,
+                null,
+              );
+            }
           }
           // handle reorder column
           if (
@@ -1217,6 +1541,119 @@ export class ColumnsService implements IColumnsService {
         );
         const driverType = dbDriver.clientType();
 
+        // Native PG enum staying as SingleSelect: option adds/renames go
+        // through ALTER TYPE on the existing type; option removes need a
+        // type rebuild (PG has no DROP VALUE). The existing text-backed PG
+        // branches further down (array_replace, array_remove) are skipped
+        // by this flag. Per-branch consumers re-derive the schema-qualified
+        // type name from `column.internal_meta` and `source` directly.
+        const isNativeEnumStaying =
+          colBody.uidt === UITypes.SingleSelect &&
+          isPgNativeEnumColumn(column, driverType);
+        // Whether the rebuild path runs after the rename loop. Set inside
+        // the entry block; gates the rebuild block further down.
+        let nativeEnumHasRemoves = false;
+        // True when the underlying PG enum type is referenced by other
+        // columns. In that case we MUST NOT mutate the shared type in place
+        // (ADD VALUE / RENAME VALUE leak to siblings). The rebuild block
+        // forks instead: creates a new type with the final option list,
+        // casts existing values via CASE for renames, re-points only this
+        // column, leaves the shared old type alone.
+        let enumIsShared = false;
+        // Record renames as {old → new} so the fork's USING clause can map
+        // existing row values to the new enum's labels.
+        const enumTitleRenames: { old_title: string; new_title: string }[] = [];
+        let enumTypeName = '';
+        let enumSchema = '';
+
+        if (isNativeEnumStaying) {
+          enumTypeName = column.internal_meta!.pg_enum_type_name!;
+          enumSchema = column.internal_meta!.pg_enum_schema_name!;
+
+          // Validate: PG enums must have at least one value.
+          if ((colBody.colOptions?.options || []).length === 0) {
+            NcError.get(context).badRequest(
+              `Cannot remove all options from this field. ` +
+                `At least one option is required.`,
+            );
+          }
+
+          const removedTitles = (column.colOptions?.options || [])
+            .filter(
+              (oldOp) =>
+                !(colBody.colOptions?.options || []).find(
+                  (newOp) =>
+                    newOp.id === oldOp.id || newOp.title === oldOp.title,
+                ),
+            )
+            .map((op) => op.title);
+          nativeEnumHasRemoves = removedTitles.length > 0;
+
+          // If the column's existing default is one of the options being
+          // removed, clear it so the rebuild can proceed. The DROP DEFAULT
+          // (step 2b) still runs against the original column.cdf; step 4
+          // checks finalLabels and skips the SET DEFAULT when the would-be
+          // new default isn't in the post-rebuild option set. The metadata
+          // persist picks up colBody.cdf=null and stores it.
+          if (
+            nativeEnumHasRemoves &&
+            column.cdf &&
+            removedTitles.includes(column.cdf)
+          ) {
+            colBody.cdf = null;
+          }
+
+          // If the column is NOT NULL, the option-delete loop's UPDATE that
+          // NULLs rows with removed values fails with 23502. Drop NOT NULL
+          // up front so the row updates succeed, and persist rqd=false so
+          // the metadata reflects the new shape. We sync column.rqd too so
+          // the later sqlMgr.tableUpdate doesn't re-emit DROP NOT NULL.
+          if (nativeEnumHasRemoves && column.rqd) {
+            const tableNameRef = baseModel.getTnPath(table.table_name);
+            await sqlClient.raw(
+              'ALTER TABLE ?? ALTER COLUMN ?? DROP NOT NULL',
+              [tableNameRef, column.column_name],
+            );
+            column.rqd = false;
+            colBody.rqd = false;
+          }
+
+          // Detect whether the enum is shared with other columns. Result is
+          // used by the rename loop (skip in-place RENAME VALUE) and the
+          // rebuild block (fork into a new type instead of replacing).
+          const sharedRefs = await sqlClient.findColumnsUsingType({
+            typeSchema: enumSchema,
+            typeName: enumTypeName,
+            excludeTableSchema: source.getConfig()?.schema || 'public',
+            excludeTableName: table.table_name,
+            excludeColumnName: column.column_name,
+          });
+          enumIsShared = sharedRefs.length > 0;
+
+          // Apply in-place ADDs only when (a) we're sole owner of the type
+          // and (b) no removes are pending. When shared, the fork rebuild
+          // creates a new type with the full final list — no separate ADD
+          // VALUE needed and the shared type stays untouched.
+          // ALTER TYPE … ADD VALUE cannot run inside a transaction block on
+          // PG <12; columnUpdate is not currently wrapped in one, so this is
+          // safe today — keep this in mind if that ever changes.
+          if (!enumIsShared && !nativeEnumHasRemoves) {
+            for (const newOp of colBody.colOptions?.options || []) {
+              const isExisting = (column.colOptions?.options || []).some(
+                (o) => o.id === newOp.id || o.title === newOp.title,
+              );
+              if (!isExisting) {
+                await sqlClient.raw(
+                  `ALTER TYPE ??.?? ADD VALUE IF NOT EXISTS ${pgQuoteLiteral(
+                    newOp.title,
+                  )}`,
+                  [enumSchema, enumTypeName],
+                );
+              }
+            }
+          }
+        }
+
         if (
           column.uidt === UITypes.SingleSelect &&
           colBody.uidt !== UITypes.SingleSelect
@@ -1294,7 +1731,7 @@ export class ColumnsService implements IColumnsService {
             const existingOptions = colBody.colOptions.options.map(
               (el) => el.title,
             );
-            const options = data.reduce((acc, el) => {
+            const options = data.reduce<{ title: string }[]>((acc, el) => {
               if (el[column.column_name]) {
                 const values = String(el[column.column_name]).split(',');
                 if (values.length > 1) {
@@ -1634,6 +2071,19 @@ export class ColumnsService implements IColumnsService {
               new_title: newOp.title,
             });
 
+            // Shared native PG enum: collect the rename for the fork's
+            // CASE-based USING clause and skip every in-place mutation
+            // below (interchange/temp-title is unnecessary because CASE
+            // evaluates each row's old text once and handles cycles
+            // natively).
+            if (isNativeEnumStaying && enumIsShared) {
+              enumTitleRenames.push({
+                old_title: option.title,
+                new_title: newOp.title,
+              });
+              continue;
+            }
+
             // Handle title conflicts by creating unique temporary titles.
             // On MySQL ENUM/SET the comparison must be case-insensitive so
             // case-only renames (apple → Apple) are routed through the
@@ -1699,16 +2149,29 @@ export class ColumnsService implements IColumnsService {
             }
 
             if (column.uidt === UITypes.SingleSelect) {
-              await baseModel.bulkUpdateAll(
-                {
-                  where: `(${column.title},eq,${option.title})`,
-                  skipValidationAndHooks: true,
-                  // include trash rows so restore lands on the renamed option
-                  includeSoftDeleted: true,
-                },
-                { [column.column_name]: newOp.title },
-                { cookie: req },
-              );
+              if (isNativeEnumStaying) {
+                // Native PG enum, sole owner: RENAME VALUE rewrites the
+                // type catalog in place. Existing rows store enum OIDs,
+                // so they automatically reflect the new label — no row
+                // UPDATE needed. Shared enums are diverted earlier.
+                await sqlClient.raw(
+                  `ALTER TYPE ??.?? RENAME VALUE ${pgQuoteLiteral(
+                    option.title,
+                  )} TO ${pgQuoteLiteral(newOp.title)}`,
+                  [enumSchema, enumTypeName],
+                );
+              } else {
+                await baseModel.bulkUpdateAll(
+                  {
+                    where: `(${column.title},eq,${option.title})`,
+                    skipValidationAndHooks: true,
+                    // include trash rows so restore lands on the renamed option
+                    includeSoftDeleted: true,
+                  },
+                  { [column.column_name]: newOp.title },
+                  { cookie: req },
+                );
+              }
             } else if (column.uidt === UITypes.MultiSelect) {
               if (driverType === 'mysql' || driverType === 'mysql2') {
                 if (colBody.dt === 'set') {
@@ -1767,16 +2230,28 @@ export class ColumnsService implements IColumnsService {
         for (const ch of interchange) {
           const newOp = ch.def_option;
           if (column.uidt === UITypes.SingleSelect) {
-            await baseModel.bulkUpdateAll(
-              {
-                where: `(${column.title},eq,${ch.temp_title})`,
-                skipValidationAndHooks: true,
-                // include trash rows so cyclic renames apply uniformly
-                includeSoftDeleted: true,
-              },
-              { [column.column_name]: newOp.title },
-              { cookie: req },
-            );
+            if (isNativeEnumStaying) {
+              // Second-pass rename: temp → final. By now every conflicting
+              // original value has been renamed away, so the destination
+              // label is free.
+              await sqlClient.raw(
+                `ALTER TYPE ??.?? RENAME VALUE ${pgQuoteLiteral(
+                  ch.temp_title,
+                )} TO ${pgQuoteLiteral(newOp.title)}`,
+                [enumSchema, enumTypeName],
+              );
+            } else {
+              await baseModel.bulkUpdateAll(
+                {
+                  where: `(${column.title},eq,${ch.temp_title})`,
+                  skipValidationAndHooks: true,
+                  // include trash rows so cyclic renames apply uniformly
+                  includeSoftDeleted: true,
+                },
+                { [column.column_name]: newOp.title },
+                { cookie: req },
+              );
+            }
           } else if (column.uidt === UITypes.MultiSelect) {
             if (driverType === 'mysql' || driverType === 'mysql2') {
               if (colBody.dt === 'set') {
@@ -1832,6 +2307,181 @@ export class ColumnsService implements IColumnsService {
           }
         }
 
+        // Native PG enum: rebuild the type when in-place ALTER TYPE isn't
+        // sufficient. Two paths:
+        //   - Sole owner: rename existing type aside, CREATE new at original
+        //     name, re-point column, DROP old. Triggered by removes (PG has
+        //     no DROP VALUE).
+        //   - Shared with other columns: forking — CREATE a new type with a
+        //     unique name, re-point only this column, leave old type alone.
+        //     Triggered by ANY option change (adds, renames, removes), since
+        //     mutating the shared type in place would leak to siblings.
+        if (isNativeEnumStaying) {
+          const hasAdds =
+            enumIsShared &&
+            (colBody.colOptions?.options || []).some(
+              (newOp) =>
+                !(column.colOptions?.options || []).some(
+                  (oldOp) =>
+                    oldOp.id === newOp.id || oldOp.title === newOp.title,
+                ),
+            );
+          const enumNeedsFork =
+            enumIsShared &&
+            (nativeEnumHasRemoves || hasAdds || enumTitleRenames.length > 0);
+          const enumNeedsSoleOwnerRebuild =
+            !enumIsShared && nativeEnumHasRemoves;
+
+          if (enumNeedsFork || enumNeedsSoleOwnerRebuild) {
+            const tableNameRef = baseModel.getTnPath(table.table_name);
+            const finalLabels = (colBody.colOptions?.options || []).map(
+              (o) => o.title,
+            );
+            const inlinedLabels = finalLabels.map(pgQuoteLiteral).join(', ');
+
+            // The type name we'll point the column at after the rebuild.
+            // Sole-owner reuses the original name; fork uses a fresh name
+            // so the shared type can keep its identity for siblings.
+            const newEnumTypeName = enumNeedsFork
+              ? `${enumTypeName}_${enumRebuildSuffix()}`
+              : enumTypeName;
+
+            // Sole-owner only: stash the existing type aside before recreating.
+            const tempTypeName = enumNeedsSoleOwnerRebuild
+              ? `${enumTypeName}_nc_old_${enumRebuildSuffix()}`
+              : '';
+
+            if (enumNeedsSoleOwnerRebuild) {
+              // 1. Rename the existing type out of the way.
+              await sqlClient.raw('ALTER TYPE ??.?? RENAME TO ??', [
+                enumSchema,
+                enumTypeName,
+                tempTypeName,
+              ]);
+            }
+
+            // 2. Create the new type with the final option list.
+            await sqlClient.raw(
+              `CREATE TYPE ??.?? AS ENUM (${inlinedLabels})`,
+              [enumSchema, newEnumTypeName],
+            );
+
+            // 2b. Drop any existing column default before the type change.
+            //     The default expression is bound to the OLD type's oid; PG
+            //     can't auto-cast `'label'::oldtype → newtype` even when the
+            //     label exists in both. Step 4 below re-applies the default
+            //     against the new type.
+            if (column.cdf) {
+              await sqlClient.raw(
+                'ALTER TABLE ?? ALTER COLUMN ?? DROP DEFAULT',
+                [tableNameRef, column.column_name],
+              );
+            }
+
+            // 3. Re-point the column at the new type. For the fork, build a
+            //    CASE in USING that maps renamed old labels to new ones —
+            //    rows store labels of the OLD shared type (which we never
+            //    touched), so direct text→new_enum casts would fail for any
+            //    renamed value. Removed values were already NULLed by the
+            //    option-delete loop above, so they don't appear in the cast.
+            if (enumNeedsFork && enumTitleRenames.length > 0) {
+              const whenClauses = enumTitleRenames
+                .map(
+                  (r) =>
+                    `WHEN ${pgQuoteLiteral(r.old_title)} THEN ${pgQuoteLiteral(
+                      r.new_title,
+                    )}`,
+                )
+                .join(' ');
+              await sqlClient.raw(
+                `ALTER TABLE ?? ALTER COLUMN ?? TYPE ??.?? USING (CASE ??::text ${whenClauses} ELSE ??::text END)::??.??`,
+                [
+                  tableNameRef,
+                  column.column_name,
+                  enumSchema,
+                  newEnumTypeName,
+                  column.column_name,
+                  column.column_name,
+                  enumSchema,
+                  newEnumTypeName,
+                ],
+              );
+            } else {
+              await sqlClient.raw(
+                'ALTER TABLE ?? ALTER COLUMN ?? TYPE ??.?? USING ??::text::??.??',
+                [
+                  tableNameRef,
+                  column.column_name,
+                  enumSchema,
+                  newEnumTypeName,
+                  column.column_name,
+                  enumSchema,
+                  newEnumTypeName,
+                ],
+              );
+            }
+
+            // 4. Re-apply the column default. ALTER COLUMN TYPE drops the
+            //    DEFAULT when PG can't implicitly cast it across distinct
+            //    enum types. Cast the literal to the new enum type
+            //    explicitly so PG doesn't fall back to text inference.
+            //    Skip when the default points at a removed option — the
+            //    pre-flight clearing left column.cdf untouched (so step 2b
+            //    above could DROP DEFAULT) but colBody.cdf=null, and the
+            //    target label isn't in finalLabels.
+            if (column.cdf) {
+              // For the fork, the default may reference an old (renamed)
+              // label. Map it through enumTitleRenames first.
+              const newCdf = enumNeedsFork
+                ? enumTitleRenames.find((r) => r.old_title === column.cdf)
+                    ?.new_title ?? column.cdf
+                : column.cdf;
+              if (finalLabels.includes(newCdf)) {
+                await sqlClient.raw(
+                  `ALTER TABLE ?? ALTER COLUMN ?? SET DEFAULT ${pgQuoteLiteral(
+                    newCdf,
+                  )}::??.??`,
+                  [
+                    tableNameRef,
+                    column.column_name,
+                    enumSchema,
+                    newEnumTypeName,
+                  ],
+                );
+              }
+            }
+
+            if (enumNeedsSoleOwnerRebuild) {
+              // 5. Drop the old type. No other column references it (we're
+              //    sole owner), but functions/indexes/views could still hold
+              //    references — log and leave for manual cleanup if so.
+              try {
+                await sqlClient.raw('DROP TYPE ??.??', [
+                  enumSchema,
+                  tempTypeName,
+                ]);
+              } catch (e) {
+                this.logger.warn(
+                  `Could not drop ${enumSchema}.${tempTypeName} after enum rebuild — ` +
+                    `it is still referenced by another database object. ` +
+                    `Field changes are persisted; orphan type left for manual cleanup. ` +
+                    `Reason: ${e?.message ?? e}`,
+                );
+              }
+            }
+
+            if (enumNeedsFork) {
+              // Persist the new type name so future updates target it.
+              const updatedInternalMeta = {
+                ...(column.internal_meta || {}),
+                pg_enum_type_name: newEnumTypeName,
+              };
+              column.internal_meta = updatedInternalMeta;
+              colBody.internal_meta = updatedInternalMeta;
+            }
+          }
+        }
+
         // handle trim value when converting it from SingleLineText cell to SingleSelect
         if (
           column.uidt === UITypes.SingleLineText &&
@@ -1878,6 +2528,18 @@ export class ColumnsService implements IColumnsService {
             });
           }
         }
+      }
+
+      // Native PG enum: getColumnPropsFromUIDT sets colBody.dt='text', but
+      // the column is actually still typed as USER-DEFINED in PG. Without
+      // this pin, alterTableColumn would see dt change from USER-DEFINED to
+      // text and emit a destructive ALTER COLUMN that tears down the native
+      // enum binding.
+      if (
+        colBody.uidt === UITypes.SingleSelect &&
+        isPgNativeEnumColumn(column, sqlClientType)
+      ) {
+        colBody.dt = 'USER-DEFINED';
       }
 
       await this.updateMetaAndDatabase(context, {
@@ -2320,6 +2982,11 @@ export class ColumnsService implements IColumnsService {
     // Get all the columns in the table and return
     await table.getColumns(context, undefined, defaultView?.id);
 
+    await this.postColumnUpdate(context, {
+      ...param.column,
+      id: param.columnId,
+    } as unknown as ColumnReqType);
+
     const updatedColumn = await Column.get(context, { colId: param.columnId });
 
     this.appHooksService.emit(AppEvents.COLUMN_UPDATE, {
@@ -2361,6 +3028,14 @@ export class ColumnsService implements IColumnsService {
       columnWebhookManager.emit();
     }
 
+    const replayBackup = getReplay('replayBackup');
+    if (replayBackup) {
+      await this.columnDataBackupHandler.restore(context, {
+        destinationColumn: updatedColumn,
+        backupRef: replayBackup,
+      });
+    }
+
     if (param.apiVersion === NcApiVersion.V3) {
       return column;
     }
@@ -2372,6 +3047,7 @@ export class ColumnsService implements IColumnsService {
     return Column.get(context, { colId: param.columnId });
   }
 
+  @TraceCommand(OperationName.columnSetAsPrimary)
   async columnSetAsPrimary(
     context: NcContext,
     param: { columnId: string; req: NcRequest },
@@ -2382,6 +3058,16 @@ export class ColumnsService implements IColumnsService {
       .then((columns) => columns.find((c) => c.pv));
     if (!oldColumn) {
       NcError.get(context).fieldNotFound(param.columnId);
+    }
+
+    // LongText (and its richMode / smartMode / ai variants) is rejected as a
+    // display value — multi-line / markdown content renders poorly in
+    // single-line surfaces (LTAR chips, breadcrumbs, audit lines, search).
+    // Existing PV columns keep working; only new selections are blocked.
+    if (oldColumn.uidt === UITypes.LongText && !oldColumn.pv) {
+      NcError.get(context).invalidRequestBody(
+        'Long Text fields cannot be set as the display value.',
+      );
     }
     const result = await Model.updatePrimaryColumn(
       context,
@@ -2460,6 +3146,7 @@ export class ColumnsService implements IColumnsService {
       suppressFormulaError?: boolean;
       apiVersion?: T;
       columnWebhookManager?: ColumnWebhookManager;
+      operationSource?: OperationSource;
     },
     ncMeta = Noco.ncMeta,
   ): Promise<T extends NcApiVersion.V3 ? Column : Model> {
@@ -2501,6 +3188,14 @@ export class ColumnsService implements IColumnsService {
     ) {
       NcError.get(context).sourceMetaReadOnly(source.alias);
     }
+
+    validateLongTextMetaExclusivity(
+      context,
+      param.column.uidt,
+      (param.column as any).meta,
+      source,
+    );
+
     if (
       (param.column as any).system ||
       [UITypes.Order, UITypes.ID, UITypes.Deleted, UITypes.Meta].includes(
@@ -2511,7 +3206,9 @@ export class ColumnsService implements IColumnsService {
         `Cannot manually create system columns`,
       );
     } else {
-      deleteColumnSystemPropsFromRequest(param.column);
+      deleteColumnSystemPropsFromRequest(param.column, {
+        operationSource: param.operationSource,
+      });
     }
 
     const base = await reuseOrSave('base', reuse, async () =>
@@ -2680,15 +3377,25 @@ export class ColumnsService implements IColumnsService {
         break;
 
       case UITypes.Links:
-      case UITypes.LinkToAnotherRecord:
+      case UITypes.LinkToAnotherRecord: {
+        // `createLTARColumn` mutates this bag with the side-effect IDs
+        // (assoc model, FK cols, back-link, reverse LTAR). After the call
+        // we deposit the bag into the trace ALS so `ColumnAddContract`
+        // (`sandbox.capture: ['ltar']`) packs it onto the changelog row.
+        const ltarCapture: LtarSideEffectIds = {};
         savedColumn = await this.createLTARColumn(context, {
-          ...param,
+          tableId: param.tableId,
+          column: param.column,
+          user: param.user,
+          req: param.req,
+          reuse: param.reuse,
+          columnWebhookManager,
+          _ltarCapture: ltarCapture,
           source,
           base,
-          reuse,
           colExtra,
-          columnWebhookManager,
         });
+        captureForTrace('ltar', ltarCapture);
 
         this.appHooksService.emit(AppEvents.RELATION_CREATE, {
           column: {
@@ -2701,6 +3408,7 @@ export class ColumnsService implements IColumnsService {
           context,
         });
         break;
+      }
 
       case UITypes.QrCode:
         validateParams(['fk_qr_value_column_id'], param.column, context);
@@ -3447,7 +4155,35 @@ export class ColumnsService implements IColumnsService {
 
     await table.getColumns(context, undefined, defaultView?.id);
 
+    await this.postColumnAdd(context, param.column, table);
+
     const newColumn = table.columns.find((c) => c.title === param.column.title);
+
+    const columnFilterKind: 'link' | 'button' | null = isLinksOrLTAR(
+      param.column,
+    )
+      ? 'link'
+      : (param.column as any).uidt === UITypes.Lookup ||
+        (param.column as any).uidt === UITypes.Rollup
+      ? 'link'
+      : (param.column as any).uidt === UITypes.Button
+      ? 'button'
+      : null;
+    if (
+      columnFilterKind &&
+      (param.column as any).filters?.length &&
+      newColumn &&
+      !isReplay()
+    ) {
+      captureForTrace(
+        'filters',
+        await this.snapshotColumnFilterTree(
+          context,
+          newColumn.id,
+          columnFilterKind,
+        ),
+      );
+    }
 
     if (!isLinksOrLTAR(param.column)) {
       this.appHooksService.emit(AppEvents.COLUMN_CREATE, {
@@ -3509,9 +4245,8 @@ export class ColumnsService implements IColumnsService {
   async columnDelete(
     context: NcContext,
     param: {
-      req?: any;
+      req: NcRequest;
       columnId: string;
-      user: UserType;
       forceDeleteSystem?: boolean;
       skipLinkPlaceholder?: boolean;
       skipTrash?: boolean;
@@ -3662,8 +4397,6 @@ export class ColumnsService implements IColumnsService {
       case UITypes.QrCode:
       case UITypes.Barcode:
       case UITypes.Button:
-        // PR review fix #3: UUID removed from this group — it has a physical DB column
-        // and must go through the default path (sqlOpPlus + tableUpdate) to drop it.
         await Column.delete2(
           context,
           {
@@ -3673,7 +4406,6 @@ export class ColumnsService implements IColumnsService {
           ncMeta,
         );
         break;
-
       case UITypes.Formula:
         await Column.delete(context, param.columnId, ncMeta);
         break;
@@ -4806,9 +5538,19 @@ export class ColumnsService implements IColumnsService {
       user: UserType;
       req: NcRequest;
       columnWebhookManager?: ColumnWebhookManager;
+      // Sandbox-replay capture slot, mutated by this method with the
+      // side-effect IDs (assoc model, FK cols, back-link, reverse LTAR).
+      // Caller passes a fresh object and reads back after the call to
+      // deposit into the trace ALS.
+      _ltarCapture?: LtarSideEffectIds;
     },
   ) {
     let savedColumn: Column;
+    // Sandbox-replay only — pre-recorded side-effect IDs threaded via the
+    // ALS bag by the columnAdd handler. Read once up front so the inner
+    // insert sites can match each row to its recorded id.
+    const replayIds = getReplay('ltarReplayIds');
+    const capture = param._ltarCapture;
 
     if ((param.column as any).is_custom_link) {
       NcError.get(context).badRequest(
@@ -4826,6 +5568,10 @@ export class ColumnsService implements IColumnsService {
       readonly?: boolean;
       meta?: Record<string, any>;
       ref_base_id?: string;
+      // Sandbox-replay — pre-injected by `idField: 'column'` so each
+      // back-link/oo/mm `Column.insert` can honor the recorded id.
+      id?: string;
+      fk_display_value_column_id?: string | null;
     };
 
     if (!ltarReq.parentId) {
@@ -4977,12 +5723,14 @@ export class ColumnsService implements IColumnsService {
         await refSqlMgr.sqlOpPlus(refSource, 'tableUpdate', tableUpdateBody);
 
         const { id } = await Column.insert(refContext, {
+          ...(replayIds?.fkColumnId ? { id: replayIds.fkColumnId } : {}),
           ...newColumn,
           uidt: UITypes.ForeignKey,
           fk_model_id: refTable.id,
         });
 
         refColumn = await Column.get(refContext, { colId: id });
+        if (capture) capture.fkColumnId = refColumn.id;
 
         // ignore relation creation if virtual
         if (!ltarReq.virtual) {
@@ -5016,6 +5764,22 @@ export class ColumnsService implements IColumnsService {
         }
       }
 
+      const hmBtOut: { childRelColId?: string; savedColumnId?: string } = {};
+      // Resolve the linked table — the one whose rows the user-facing LTAR
+      // column surfaces in the chip. This matches fk_related_model_id of
+      // the user-facing column after createHmAndBtColumn runs:
+      //   HM → fk_related_model_id = childId (= refTable.id)
+      //   BT → fk_related_model_id = parentId (= table.id)
+      // The override column always lives on the linked table (never "self").
+      const linkedTableId =
+        ltarReq.type === 'bt' ? ltarReq.parentId : ltarReq.childId;
+      const linkedTable = table.id === linkedTableId ? table : refTable;
+      const hmBtDisplayValueColumnId = resolveDisplayValueColumnOrThrow(
+        context,
+        linkedTable,
+        ltarReq.fk_display_value_column_id,
+      );
+
       savedColumn = await createHmAndBtColumn(
         context,
         param.req,
@@ -5033,11 +5797,18 @@ export class ColumnsService implements IColumnsService {
         {
           ...param.colExtra,
           readonly: ltarReq.readonly || false,
+          fk_display_value_column_id: hmBtDisplayValueColumnId,
         },
         undefined,
         undefined,
         param.columnWebhookManager,
+        {
+          childRelColId: replayIds?.reverseColumnId,
+          savedColumnId: ltarReq.id,
+        },
+        hmBtOut,
       );
+      if (capture) capture.reverseColumnId = hmBtOut.childRelColId;
     } else if (!isMMLike && ltarReq.type === 'oo') {
       // populate fk column name
       const fkColName = getUniqueColumnName(
@@ -5085,12 +5856,14 @@ export class ColumnsService implements IColumnsService {
         await sqlMgr.sqlOpPlus(refSource, 'tableUpdate', tableUpdateBody);
 
         const { id } = await Column.insert(refContext, {
+          ...(replayIds?.fkColumnId ? { id: replayIds.fkColumnId } : {}),
           ...newColumn,
           uidt: UITypes.ForeignKey,
           fk_model_id: refTable.id,
         });
 
         refColumn = await Column.get(refContext, { colId: id });
+        if (capture) capture.fkColumnId = refColumn.id;
 
         // ignore relation creation if virtual
         if (!ltarReq.virtual) {
@@ -5123,6 +5896,14 @@ export class ColumnsService implements IColumnsService {
           });
         }
       }
+      const ooOut: { childRelColId?: string; savedColumnId?: string } = {};
+      // OO user-facing column (HM-side) displays refTable records
+      const ooDisplayValueColumnId = resolveDisplayValueColumnOrThrow(
+        context,
+        refTable,
+        ltarReq.fk_display_value_column_id,
+      );
+
       savedColumn = await createOOColumn(
         context,
         param.req,
@@ -5139,11 +5920,18 @@ export class ColumnsService implements IColumnsService {
         {
           ...param.colExtra,
           readonly: ltarReq.readonly || false,
+          fk_display_value_column_id: ooDisplayValueColumnId,
         },
         undefined,
         undefined,
         param.columnWebhookManager,
+        {
+          childRelColId: replayIds?.reverseColumnId,
+          savedColumnId: ltarReq.id,
+        },
+        ooOut,
       );
+      if (capture) capture.reverseColumnId = ooOut.childRelColId;
     } else if (isMMLike || ltarReq.type === 'mm') {
       const aTn = await getJunctionTableName(param, table, refTable);
       const aTnAlias = aTn;
@@ -5160,6 +5948,12 @@ export class ColumnsService implements IColumnsService {
 
       associateTableCols.push(
         {
+          // Pre-set ID on replay so `Column.bulkInsert` honors it (the
+          // `column_name` map lookup wouldn't match — assoc-table column
+          // names embed the source prefix which differs across bases).
+          ...(replayIds?.assocChildColId
+            ? { id: replayIds.assocChildColId }
+            : {}),
           cn: refColumnName,
           column_name: refColumnName,
           title: refColumnName,
@@ -5175,6 +5969,9 @@ export class ColumnsService implements IColumnsService {
           uidt: UITypes.ForeignKey,
         },
         {
+          ...(replayIds?.assocParentColId
+            ? { id: replayIds.assocParentColId }
+            : {}),
           cn: columnName,
           column_name: columnName,
           title: columnName,
@@ -5196,12 +5993,15 @@ export class ColumnsService implements IColumnsService {
         _tn: aTnAlias,
         columns: associateTableCols,
       });
-
+      if (replayIds?.assocDefaultViewId) {
+        setReplay('sandboxDefaultViewId', replayIds.assocDefaultViewId);
+      }
       const assocModel = await Model.insert(
         context,
         param.base.id,
         param.source.id,
         {
+          ...(replayIds?.assocModelId ? { id: replayIds.assocModelId } : {}),
           table_name: aTn,
           title: aTnAlias,
           // todo: sanitize
@@ -5249,6 +6049,7 @@ export class ColumnsService implements IColumnsService {
       );
 
       // todo: skip hm and bt if new type
+      const hmBtRefOut: { childRelColId?: string; savedColumnId?: string } = {};
       await createHmAndBtColumn(
         context,
         param.req,
@@ -5268,7 +6069,11 @@ export class ColumnsService implements IColumnsService {
         undefined,
         // not need to pass columnWebhookManager here
         undefined,
+        replayIds?.hmBtCallRef,
+        hmBtRefOut,
       );
+      const hmBtTableOut: { childRelColId?: string; savedColumnId?: string } =
+        {};
       await createHmAndBtColumn(
         context,
         param.req,
@@ -5288,6 +6093,8 @@ export class ColumnsService implements IColumnsService {
         undefined,
         // not need to pass columnWebhookManager here
         undefined,
+        replayIds?.hmBtCallTable,
+        hmBtTableOut,
       );
 
       let refCrossBaseLinkProps: {
@@ -5344,6 +6151,7 @@ export class ColumnsService implements IColumnsService {
         : pluralize(refTable.title);
 
       savedColumn = await Column.insert(context, {
+        ...(ltarReq.id ? { id: ltarReq.id } : {}),
         title: getUniqueColumnAliasName(
           await table.getColumns(context),
           param.column.title ?? defaultTitle,
@@ -5363,6 +6171,11 @@ export class ColumnsService implements IColumnsService {
         fk_child_column_id: primaryKey.id,
         fk_parent_column_id: refPrimaryKey.id,
         fk_target_view_id: childView?.id,
+        fk_display_value_column_id: resolveDisplayValueColumnOrThrow(
+          context,
+          refTable,
+          ltarReq.fk_display_value_column_id,
+        ),
 
         fk_mm_model_id: assocModel.id,
         fk_mm_child_column_id: parentCol.id,
@@ -5393,6 +6206,9 @@ export class ColumnsService implements IColumnsService {
         : pluralize(table.title);
 
       const parentRelCol = await Column.insert(refContext, {
+        ...(replayIds?.reverseColumnId
+          ? { id: replayIds.reverseColumnId }
+          : {}),
         title: getUniqueColumnAliasName(
           [
             ...(await refTable.getColumns(refContext)),
@@ -5436,6 +6252,17 @@ export class ColumnsService implements IColumnsService {
         // include cross base link props
         ...refCrossBaseLinkProps,
       });
+
+      if (capture) {
+        capture.assocModelId = assocModel.id;
+        const assocViews = await assocModel.getViews(context);
+        capture.assocDefaultViewId = assocViews?.[0]?.id;
+        capture.reverseColumnId = parentRelCol.id;
+        capture.assocChildColId = childCol.id;
+        capture.assocParentColId = parentCol.id;
+        capture.hmBtCallRef = hmBtRefOut;
+        capture.hmBtCallTable = hmBtTableOut;
+      }
 
       this.appHooksService.emit(AppEvents.COLUMN_CREATE, {
         table: refTable,
@@ -5585,43 +6412,51 @@ export class ColumnsService implements IColumnsService {
     };
   }
 
-  async columnBulk(
+  @TraceCommand(OperationName.columnsBulk)
+  async columnsBulk(
     context: NcContext,
-    tableId: string,
-    params: {
+    param: {
+      tableId: string;
       hash: string;
       ops: {
         op: 'add' | 'update' | 'delete';
         column: Partial<Column>;
       }[];
+      visibility?: Array<{
+        viewId: string;
+        columnId: string;
+        column: {
+          show?: boolean | 0 | 1 | null;
+          order?: number | null;
+          underline?: boolean | 0 | 1 | null;
+          bold?: boolean | 0 | 1 | null;
+          italic?: boolean | 0 | 1 | null;
+        };
+      }>;
+      req: NcRequest;
       columnWebhookManager?: ColumnWebhookManager;
     },
-    req: NcRequest,
   ) {
-    // TODO validatePayload
-
     const table = await Model.getWithInfo(context, {
-      id: tableId,
+      id: param.tableId,
     });
 
     if (!table) {
-      NcError.get(context).tableNotFound(tableId);
+      NcError.get(context).tableNotFound(param.tableId);
     }
 
-    if (table.columnsHash !== params.hash) {
+    if (table.columnsHash !== param.hash) {
       NcError.get(context).outOfSync(
         'Columns are updated by someone else! Your changes are rejected. Please refresh the page and try again.',
       );
     }
 
     const source = await Source.get(context, table.source_id);
-
     if (!source) {
       NcError.get(context).sourceNotFound(table.source_id);
     }
 
     const base = await source.getProject(context);
-
     if (!base) {
       NcError.get(context).baseNotFound(source.base_id);
     }
@@ -5652,16 +6487,13 @@ export class ColumnsService implements IColumnsService {
       baseModel,
     };
 
-    const ops = params.ops;
-
-    for (const op of ops) {
+    for (const op of param.ops) {
       if (op.op === 'update') {
         if (!op.column || !op.column?.id) {
           NcError.get(context).badRequest(
             'Bad request, update operation requires column id',
           );
         }
-
         validateDateFormatMeta(context, op.column?.meta);
       } else if (op.op === 'delete') {
         if (!op.column || !op.column?.id) {
@@ -5678,71 +6510,79 @@ export class ColumnsService implements IColumnsService {
       }
     }
 
-    const failedOps = [];
-    // Perform operations in a loop, capturing any errors for individual operations
-    for (const op of ops) {
+    // Per-add-op new column ids are captured automatically by the
+    // macro decorator's auto-instrument (each `columnAdd` child becomes
+    // a transcript entry whose `entityId` is resolved via
+    // ColumnAddContract.entry.entity_id) — no manual title→id re-query.
+    const failedOps: Array<{
+      op: 'add' | 'update' | 'delete';
+      column: Partial<Column>;
+      error: string;
+    }> = [];
+    for (const op of param.ops) {
       const column = op.column;
-
-      if (op.op === 'add') {
-        try {
-          const tableMeta = (await this.columnAdd(context, {
-            tableId,
+      try {
+        if (op.op === 'add') {
+          await this.columnAdd(context, {
+            tableId: param.tableId,
             column: column as ColumnReqType,
-            req,
-            user: req.user,
+            req: param.req,
+            user: param.req.user,
             reuse,
-          })) as Model;
-
-          await this.postColumnAdd(context, column as ColumnReqType, tableMeta);
-        } catch (e) {
-          const dbError = DBErrorExtractor.get().extractDbError(e, {
-            clientType: source.type as unknown as ClientType, // Pass the client type from source
           });
-
-          failedOps.push({
-            ...op,
-            error: dbError?.message || e.message, // Use extracted message, fallback to original
-          });
-        }
-      } else if (op.op === 'update') {
-        try {
+        } else if (op.op === 'update') {
           await this.columnUpdate(context, {
-            columnId: op.column.id,
+            columnId: column.id as string,
             column: column as ColumnReqType,
-            req,
-            user: req.user,
+            req: param.req,
+            user: param.req.user,
             reuse,
           });
-
-          await this.postColumnUpdate(context, column as ColumnReqType);
-        } catch (e) {
-          const dbError = DBErrorExtractor.get().extractDbError(e, {
-            clientType: source.type as unknown as ClientType, // Pass the client type from source
-          });
-
-          failedOps.push({
-            ...op,
-            error: dbError?.message || e.message, // Use extracted message, fallback to original
-          });
+        } else if (op.op === 'delete') {
+          await this.handleColumnBulkDelete(context, op, param.req);
         }
-      } else if (op.op === 'delete') {
-        try {
-          await this.handleColumnBulkDelete(context, op, req);
-        } catch (e) {
-          const dbError = DBErrorExtractor.get().extractDbError(e, {
-            clientType: source.type as unknown as ClientType, // Pass the client type from source
-          });
+      } catch (e: any) {
+        const dbError = DBErrorExtractor.get().extractDbError(e, {
+          clientType: source.type as unknown as ClientType,
+        });
+        failedOps.push({
+          ...op,
+          error: dbError?.message || e.message,
+        });
+      }
+    }
 
-          failedOps.push({
-            ...op,
-            error: dbError?.message || e.message, // Use extracted message, fallback to original
-          });
-        }
+    const failedVisibility: Array<{
+      viewId: string;
+      columnId: string;
+      error: string;
+    }> = [];
+    for (const v of param.visibility ?? []) {
+      try {
+        await this.viewColumnsService.columnUpdate(context, {
+          viewId: v.viewId,
+          columnId: v.columnId,
+          column: v.column as any,
+          req: param.req,
+        });
+      } catch (e: any) {
+        this.logger.error(
+          `View column visibility update failed (view=${v.viewId} column=${v.columnId}): ${e?.message}`,
+          e?.stack,
+        );
+        const safeError =
+          e instanceof NcBaseError ? e.message : 'Visibility update failed';
+        failedVisibility.push({
+          viewId: v.viewId,
+          columnId: v.columnId,
+          error: safeError,
+        });
       }
     }
 
     return {
       failedOps,
+      failedVisibility,
     };
   }
 
@@ -5761,6 +6601,30 @@ export class ColumnsService implements IColumnsService {
     // placeholder for post column update hook
   }
 
+  protected async snapshotColumnFilterTree(
+    context: NcContext,
+    columnId: string,
+    kind: 'link' | 'button',
+  ): Promise<Array<Record<string, unknown>>> {
+    const roots =
+      kind === 'button'
+        ? await Filter.rootFilterListByButtonColumn(context, {
+            buttonColId: columnId,
+          })
+        : await Filter.rootFilterListByLink(context, { columnId });
+    const walk = async (f: Filter): Promise<Record<string, unknown>> => {
+      const children = f.is_group ? (await f.getChildren(context)) ?? [] : [];
+      const childNodes = await Promise.all(
+        children.map((c) => walk(c as Filter)),
+      );
+      return {
+        ...(f as unknown as Record<string, unknown>),
+        ...(childNodes.length ? { children: childNodes } : {}),
+      };
+    };
+    return Promise.all(roots.map((r) => walk(r as Filter)));
+  }
+
   // Hook used by columnBulk's delete branch. CE hard-deletes; EE overrides
   // this to soft-delete via baseTrashService so bulk deletes route through
   // the trash system identically to the single-column delete path.
@@ -5772,7 +6636,6 @@ export class ColumnsService implements IColumnsService {
     await this.columnDelete(context, {
       columnId: op.column.id,
       req,
-      user: req.user,
     });
   }
 
@@ -5847,9 +6710,14 @@ export class ColumnsService implements IColumnsService {
       NcError.get(context).badRequest('Invalid table id');
     }
 
-    // filter out columns other than primary key and display column
+    // filter out columns other than primary key, display column, and the
+    // LTAR's custom display value override (fk_display_value_column_id).
+    // Without including the override here, shared-base + cross-base LTAR
+    // chips fall back to the PV because the frontend meta doesn't have
+    // the override column.
+    const customDisplayColId = (colOptions as any).fk_display_value_column_id;
     table.columns = table.columns.filter((col) => {
-      return col.pk || col.pv;
+      return col.pk || col.pv || col.id === customDisplayColId;
     });
 
     // Check table visibility access and add flag
@@ -6455,6 +7323,8 @@ export class ColumnsService implements IColumnsService {
               fk_mm_parent_column_id: childCol.id,
               fk_related_model_id: hmColOptions.fk_related_model_id,
               fk_target_view_id: hmColOptions.fk_target_view_id,
+              fk_display_value_column_id:
+                hmColOptions.fk_display_value_column_id,
               virtual: isVirtual,
               version: LinksVersion.V2,
               ...crossBaseLinkProps,
@@ -6495,6 +7365,7 @@ export class ColumnsService implements IColumnsService {
             fk_mm_parent_column_id: parentCol.id,
             fk_related_model_id: btColOptions.fk_related_model_id,
             fk_target_view_id: btColOptions.fk_target_view_id,
+            fk_display_value_column_id: btColOptions.fk_display_value_column_id,
             virtual: isVirtual,
             version: LinksVersion.V2,
             ...refCrossBaseLinkProps,
@@ -6529,6 +7400,8 @@ export class ColumnsService implements IColumnsService {
               fk_mm_parent_column_id: childCol.id,
               fk_related_model_id: hmColOptions.fk_related_model_id,
               fk_target_view_id: hmColOptions.fk_target_view_id,
+              fk_display_value_column_id:
+                hmColOptions.fk_display_value_column_id,
               virtual: isVirtual,
               column_order: columnOrder,
               ...crossBaseLinkProps,
@@ -6926,6 +7799,7 @@ export class ColumnsService implements IColumnsService {
             fk_mm_parent_column_id: colOptions.fk_mm_parent_column_id,
             fk_related_model_id: colOptions.fk_related_model_id,
             fk_target_view_id: colOptions.fk_target_view_id,
+            fk_display_value_column_id: colOptions.fk_display_value_column_id,
             virtual: colOptions.virtual,
             column_order: mmColumnOrder,
             // Cross-base properties — needed for cross-base relations

@@ -16,6 +16,7 @@ export const CanvasColumnInj: InjectionKey<Ref<ColumnType>> = Symbol('canvas-col
 export const MetaInj: InjectionKey<ComputedRef<TableType> | Ref<TableType>> = Symbol('meta-injection')
 export const TabMetaInj: InjectionKey<ComputedRef<TabItem> | Ref<TabItem>> = Symbol('tab-meta-injection')
 export const IsFormInj: InjectionKey<Ref<boolean>> = Symbol('is-form-injection')
+export const FormFieldAutocompleteInj: InjectionKey<Ref<string | undefined>> = Symbol('form-field-autocomplete-injection')
 export const IsCalendarInj: InjectionKey<Ref<boolean>> = Symbol('is-calendar-injection')
 export const IsTimelineInj: InjectionKey<Ref<boolean>> = Symbol('is-timeline-injection')
 export const IsSurveyFormInj: InjectionKey<Ref<boolean>> = Symbol('is-survey-form-injection')
@@ -96,7 +97,6 @@ export const TreeViewInj: InjectionKey<{
     title: string,
     orignalTitle: string,
     updateTitle: (title: string) => void,
-    undo?: boolean,
     disableTitleDiffCheck?: boolean,
   ) => void
   openViewDescriptionDialog: (view: ViewType) => void
@@ -170,3 +170,12 @@ export const IsWsBaseListModalInj: InjectionKey<Ref<boolean>> = Symbol('is-ws-ba
 export const IsSettingsSidebarInj: InjectionKey<Ref<boolean>> = Symbol('is-settings-sidebar-injection')
 
 export const DocIdInj: InjectionKey<Ref<string>> = Symbol('doc-id-injection')
+
+/**
+ * Cell-keyed attachment context for SmartText fields. When present, image and
+ * file attachment nodes resolve their URLs via the cell-keyed proxy endpoint
+ * (table+column+row triple) instead of the doc-keyed one.
+ */
+export const SmartTextCellAttachmentInj: InjectionKey<Ref<{ tableId: string; columnId: string; rowId: string } | null>> = Symbol(
+  'smart-text-cell-attachment-injection',
+)

@@ -35,6 +35,8 @@ useUserSync()
 
 useRealtime()
 
+useUndoRedo()
+
 applyNonSelectable()
 
 const { chatwootInit } = useProvideChatwoot()
@@ -163,4 +165,5 @@ const _ = (window as any).ResizeObserver
 
   <LazyChatPanel />
   <LazyChatFab />
+  <LazySandboxChangelogDrawer />
 </template>
