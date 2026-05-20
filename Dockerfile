@@ -17,11 +17,9 @@ WORKDIR /usr/app
 # Copy all workspace files
 COPY . .
 
-# Install all dependencies at the root (skip postinstall scripts —
-# nuxt prepare would fail because nocodb-sdk hasn't been built yet)
 # CI=true prevents pnpm from prompting to purge node_modules (Docker has no TTY)
 ENV CI=true
-RUN pnpm install --no-frozen-lockfile --ignore-scripts
+RUN pnpm install --no-frozen-lockfile
 
 # Build internal dependencies in order
 RUN pnpm --filter nocodb-sdk run build
@@ -39,6 +37,12 @@ RUN pnpm exec nuxt build --spa
 WORKDIR /usr/app/packages/nocodb
 # Ensure the public directory exists and copy the frontend build into it
 RUN mkdir -p src/public && cp -r ../nc-gui/.output/public/* src/public/
+# Rebuild native modules (sqlite3, sharp) — their postinstall scripts were
+# skipped by --ignore-scripts above, so the .node binaries are missing.
+# pnpm rebuild from the package dir ensures deps are in scope.
+# Native modules (sqlite3, sharp, etc.) now build during pnpm install
+# since we removed --ignore-scripts
+
 # Build the production bundle (TsChecker disabled — pre-existing TS issues in upstream)
 # pnpm exec triggers a deps check in Docker that fails — use node directly
 ENV NC_DISABLE_TS_CHECKER=true
@@ -51,11 +55,19 @@ WORKDIR /usr/app
 # libvips is often required by sharp
 RUN apt-get update && apt-get install -y libvips-dev && rm -rf /var/lib/apt/lists/*
 
-# Copy the bundled backend and the node_modules (for native modules)
+# Copy the bundled backend
 COPY --from=builder /usr/app/packages/nocodb/dist ./dist
-COPY --from=builder /usr/app/node_modules ./node_modules
 
-# Set environment
+# Copy pnpm virtual store (contains all packages) AND the package-level
+# node_modules so Node can resolve runtime deps that aren't hoisted to root.
+COPY --from=builder /usr/app/node_modules ./node_modules
+COPY --from=builder /usr/app/packages/nocodb/node_modules ./packages/nocodb/node_modules
+
+# Help Node find modules in the package-level node_modules as well as root.
+# bundle.js lives in dist/ so Node walks up to /usr/app/node_modules first;
+# NODE_PATH adds the nocodb package-level dir as a fallback for deps that
+# pnpm strict mode kept isolated (e.g. @sentry/node).
+ENV NODE_PATH=/usr/app/node_modules:/usr/app/packages/nocodb/node_modules
 ENV NODE_ENV=production
 ENV NC_DOCKER=true
 
