@@ -19,6 +19,8 @@ COPY . .
 
 # Install all dependencies at the root (skip postinstall scripts —
 # nuxt prepare would fail because nocodb-sdk hasn't been built yet)
+# CI=true prevents pnpm from prompting to purge node_modules (Docker has no TTY)
+ENV CI=true
 RUN pnpm install --no-frozen-lockfile --ignore-scripts
 
 # Build internal dependencies in order
@@ -38,8 +40,9 @@ WORKDIR /usr/app/packages/nocodb
 # Ensure the public directory exists and copy the frontend build into it
 RUN mkdir -p src/public && cp -r ../nc-gui/.output/public/* src/public/
 # Build the production bundle (TsChecker disabled — pre-existing TS issues in upstream)
+# pnpm exec triggers a deps check in Docker that fails — use node directly
 ENV NC_DISABLE_TS_CHECKER=true
-RUN pnpm exec rspack --config rspack.config.js
+RUN npx rspack --config rspack.config.js
 
 # Stage 2: Final Production Image
 FROM node:22-bookworm-slim
