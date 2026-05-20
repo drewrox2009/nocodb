@@ -2,8 +2,9 @@ packages:
   - "packages/nocodb-sdk"
   - "packages/nocodb-sdk-v2"
   - "packages/nc-gui"
-  - "packages/nc-mail-templates"
+  # nc-mail-templates directory doesn't exist yet — referenced by root scripts
   - "packages/nocodb"
+  - "packages/noco-integrations"
 
   - "packages/nc-secret-mgr"
 

@@ -1,4 +1,3 @@
-import type { Request } from 'express';
 import type { TableType, UserType } from '~/lib/Api';
 import { NcApiVersion } from './enums';
 
@@ -59,7 +58,29 @@ export interface NcAdditionalContext {
   [key: string]: unknown;
 }
 
-export interface NcRequest extends Partial<Request> {
+export interface NcRequest {
+  /** Express/NestJS-compatible request properties */
+  body?: any;
+  params?: Record<string, string>;
+  query?: Record<string, any>;
+  headers?: Record<string, string | string[] | undefined>;
+  method?: string;
+  path?: string;
+  url?: string;
+  originalUrl?: string;
+  ip?: string;
+  ips?: string[];
+  protocol?: string;
+  secure?: boolean;
+  hostname?: string;
+  cookies?: Record<string, string>;
+  signedCookies?: Record<string, string>;
+  files?: any[];
+  route?: any;
+  res?: any;
+  next?: any;
+
+  /** NocoDB-specific properties */
   context: NcContext;
   ncSocketId?: string;
   ncTabId?: string;
@@ -78,7 +99,6 @@ export interface NcRequest extends Partial<Request> {
   ncSiteUrl: string;
   dashboardUrl: string;
   clientIp?: string;
-  query?: Record<string, any>;
   skipAudit?: boolean;
 }
 

@@ -219,6 +219,7 @@
     "eslint-plugin-prettier": "^4.2.1",
     "happy-dom": "^20.0.0",
     "nuxt": "3.17.4",
+    "vue": "^3.5.14",
     "nuxt-echarts": "^0.3.3",
     "nuxt-windicss": "^3.0.1",
     "prettier": "^2.8.8",
