@@ -30,8 +30,8 @@ RUN pnpm --filter nocodb-integrations run build || echo "Integrations build skip
 WORKDIR /usr/app/packages/nc-gui
 RUN pnpm exec nuxt prepare
 
-# Build Frontend
-RUN pnpm exec nuxt build --spa
+# Build Frontend (generate produces static index.html; build --spa does not)
+RUN pnpm exec nuxi generate --spa
 
 # Build Backend
 WORKDIR /usr/app/packages/nocodb
@@ -58,6 +58,7 @@ COPY --from=builder /usr/app/packages/nocodb/node_modules ./packages/nocodb/node
 
 # Help Node find modules in the package-level node_modules as well as root
 ENV NODE_PATH=/usr/app/node_modules:/usr/app/packages/nocodb/node_modules
+ENV NC_GUI_DIST_PATH=/usr/app/dist/public
 ENV NODE_ENV=production
 ENV NC_DOCKER=true
 
