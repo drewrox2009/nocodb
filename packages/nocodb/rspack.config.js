@@ -53,6 +53,10 @@ module.exports = {
     nodeEnv: false,
   },
   externals: [
+    // Explicit externals resolved before nodeExternals; these are transitive
+    // deps that live in the pnpm virtual store and can't be found by rspack's
+    // module resolver during bundling. They resolve fine at runtime via Node.
+    'ipaddr.js',
     nodeExternals({
       allowlist: ['nocodb-sdk'],
     }),

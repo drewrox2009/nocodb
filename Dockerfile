@@ -39,10 +39,7 @@ WORKDIR /usr/app/packages/nocodb
 RUN mkdir -p src/public && cp -r ../nc-gui/.output/public/* src/public/
 # Build the production bundle (TsChecker disabled — pre-existing TS issues in upstream)
 ENV NC_DISABLE_TS_CHECKER=true
-# NODE_PATH helps rspack resolve transitive deps (e.g. ipaddr.js) that live in
-# the pnpm virtual store rather than the local package node_modules.
-ENV NODE_PATH=/usr/app/node_modules:/usr/app/packages/nocodb/node_modules
-RUN npx rspack --config rspack.config.js || test -f dist/bundle.js
+RUN npx rspack --config rspack.config.js
 
 # Stage 2: Final Production Image
 FROM node:22-bookworm-slim
